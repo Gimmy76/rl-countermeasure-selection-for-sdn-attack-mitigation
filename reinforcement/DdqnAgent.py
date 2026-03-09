@@ -187,7 +187,7 @@ class DoubleDeepQNetwork():
         # Convert to numpy for speed by vectorization
         x = []
         y = []
-        minibatch_array = np.array(minibatch)
+        minibatch_array = np.array(minibatch, dtype=object)  # Convert to numpy array for vectorized operations
         st = np.zeros((0, self.nS))  # States
         nst = np.zeros((0, self.nS))  # Next States
         for i in range(len(minibatch_array)):  # Creating the state and next state np arrays
