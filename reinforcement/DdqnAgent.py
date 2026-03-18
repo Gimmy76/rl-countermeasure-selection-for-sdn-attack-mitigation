@@ -14,7 +14,7 @@ class DoubleDeepQNetwork():
     # Sets up hyperparameters like epsilon for exploration, gamma for discounting, and batch size for training.
     # Initializes the neural network models for both the primary and target Q-networks.
     # If prefilled actions are provided, they are loaded for controlled execution.
-    def __init__(self, config, env, http_client, is_controlled, is_prefilled_actions):
+    def __init__(self, config, env, http_client, is_controlled, is_prefilled_actions, gamma=0.85, learning_rate=0.01, batch_size=8):
         self.ACTIONS = None
         self.config = config
         self.env = env
@@ -23,16 +23,16 @@ class DoubleDeepQNetwork():
         self.is_prefilled_actions = is_prefilled_actions
         self.nS = self.env.INPUT_SHAPE
         self.nA = self.env.OUTPUT_SHAPE
-        self.gamma = 0.85
+        self.gamma = gamma
         self.epsilon = 1.0
         self.epsilon_min = 0.01
         # Experimentation Epsilon decay Values:
         #  50 episode X  50 step ==> 2500 ==> 0.998
         #  50 episode X 100 step ==> 5000 ==> 0.999
         self.epsilon_decay = config.epsilon_decay
-        self.learning_rate = 0.01
+        self.learning_rate = learning_rate
         # self.tau = 0.125 # TODO: Possible future improvement
-        self.batch_size = 8
+        self.batch_size = batch_size
         self.memory_size = 2500
         self.memory = deque(maxlen=self.memory_size)
         self.update_target_each = 10 # steps
