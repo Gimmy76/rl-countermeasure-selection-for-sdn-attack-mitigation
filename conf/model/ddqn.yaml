@@ -1,0 +1,5 @@
+
+# Double Deep Q-Network (DDQN) configuration for SDN attack mitigation.
+
+learning_rate: 0.01
+discount_factor: 0.85

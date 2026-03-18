@@ -1,0 +1,5 @@
+# Reward configuration for SDN attack mitigation using reinforcement learning.
+
+latency_weight: 1.5
+jitter_weight: 2.0
+throughput_weight: 1.0

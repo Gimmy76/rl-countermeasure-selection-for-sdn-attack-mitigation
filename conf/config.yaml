@@ -1,0 +1,19 @@
+defaults:
+  - reward: static
+  - model: ddqn
+  - _self_
+
+# Global parameters for the training process
+mode: "train"
+host_topo: "host-topology-6hosts.json"
+episodes: 50
+steps: 100
+epsilon_decay: 0.998
+nbr_controlled_switches: 4
+tune_trials: 10
+
+
+# Specific parameters for the reward function
+training:
+  learning_rate: 0.01
+  discount_factor: 0.85

@@ -1,0 +1,4 @@
+# Static reward configuration for SDN attack mitigation using reinforcement learning.
+
+w.latency : 1.0
+w:jitter: 1.0
