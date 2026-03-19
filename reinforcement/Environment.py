@@ -894,24 +894,21 @@ class Environment():
     def calculate_latency_reward(self, action_can_be_taken, avg_latency):
         done = False
         if avg_latency >= self.max_latency_s:
-            reward = -3  # -2.5 (original value)
+            reward = self.reward_config["bounds"]["min"]
             done = True
         elif avg_latency <= self.tolerable_latency_s:
-            reward = 3  # +2.5 (original value)
+            reward = self.reward_config["bounds"]["max"]
             done = True
         elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
-            reward = -0.5  # -0.5 (original value)
+            reward = self.reward_config["penalty"]
             done = False
         elif not action_can_be_taken:
-            reward = -1
+            reward = -0.5  # era -1 fisso, ora penalty più leggera
             done = False
         else:
-            if avg_latency - 0.002 >= self.last_recorded_latency:
-                reward = -1
-            elif avg_latency + 0.002 <= self.last_recorded_latency:
-                reward = 1
-            else:
-                reward = -0.1
+        # reward continua basata sul miglioramento relativo
+            improvement = self.last_recorded_latency - avg_latency
+            reward = float(np.clip(improvement / max(self.tolerable_latency_s, 1e-9), -1.0, 1.0))
             done = False
         self.last_recorded_latency = avg_latency
         print(f"(Reinforcement) =====> Calculated latency reward as {reward} (done=>{done})")
@@ -920,29 +917,26 @@ class Environment():
     def calculate_jitter_reward(self, action_can_be_taken, avg_jitter):
         done = False
         if avg_jitter >= self.max_jitter_s:
-            reward = -3  # -2.5 (original value)
+            reward = self.reward_config["bounds"]["min"]
             done = True
         elif avg_jitter <= self.tolerable_jitter_s:
-            reward = 3  # +2.5 (original value)
+            reward = self.reward_config["bounds"]["max"]
             done = True
         elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
-            reward = -0.5  # -0.5 (original value)
+            reward = self.reward_config["penalty"]
             done = False
         elif not action_can_be_taken:
-            reward = -1
+            reward = -0.5  # era -1 fisso
             done = False
         else:
-            if avg_jitter - 0.002 >= self.last_recorded_jitter:
-                reward = -1
-            elif avg_jitter + 0.002 <= self.last_recorded_jitter:
-                reward = 1
-            else:
-                reward = -0.1
+        # reward continua basata sul miglioramento relativo
+            improvement = self.last_recorded_jitter - avg_jitter
+            reward = float(np.clip(improvement / max(self.tolerable_jitter_s, 1e-9), -1.0, 1.0))
             done = False
         self.last_recorded_jitter = avg_jitter
         print(f"(Reinforcement) =====> Calculated jitter reward as {reward} (done=>{done})")
         return reward, done
-
+    
     # Calculates the reward for the reinforcement learning agent based on multiple network performance metrics.
     # Rewards are calculated using latency and jitter to guide the agent's learning process.
     def calculate_reward(self, state, action_can_be_taken):
@@ -961,14 +955,16 @@ class Environment():
         r2, d2 = self.calculate_latency_reward(action_can_be_taken, avg_latency)
         r3, d3 = self.calculate_jitter_reward(action_can_be_taken, avg_jitter)
 
-        reward = r1 + r2 + r3
+        r_loss = -float(np.clip(avg_PKT_loss_percentage * 2.0, 0.0, 1.0))
+        reward = r1 + r2 + r3 + r_loss
         # Set (done) to False in order to calibrate the system
         # done = False
         done = d1 or d2 or d3
 
-        print(f"(Reinforcement) <-----> result after calculating reward = {reward} (done={done})")
+        print(f"(Reinforcement) <-----> result after calculating reward = {reward} "
+          f"(r_latency={r2:.3f}, r_jitter={r3:.3f}, r_loss={r_loss:.3f}, done={done})")
         return reward, done, avg_PKT_loss_percentage, avg_real_delay, avg_latency, avg_jitter
-
+   
     # Resets the environment to its initial state, clearing all episode data and network configurations.
     def reset(self):
         print("----> Environment reset")
