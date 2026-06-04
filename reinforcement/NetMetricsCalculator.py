@@ -1,277 +1,410 @@
-from scapy.all import *
-from scapy.layers.inet import IP, TCP, Ether
+"""
+NetMetricsCalculator.py — sostituisce CICFlowMeter + il vecchio NetMetricsCalculator.
+
+Produce due output dallo stesso pcap in un unico passaggio:
+  1. metrics.json  — latency, jitter, throughput, APTT per host
+  2. cic_flow.csv  — colonne equivalenti a CICFlowMeter usate da Environment.py:
+       Src IP, Dst IP, Dst Port, Flow Pkts/s, Flow Byts/s,
+       Tot Fwd Pkts, Tot Bwd Pkts, TotLen Fwd Pkts, TotLen Bwd Pkts, ACK Flag Cnt
+
+Velocizzazione: usa tshark -T fields invece di Scapy rdpcap().
+tshark (C) è 10-100x più veloce di Scapy per pcap grandi.
+tcp.analysis.ack_rtt fornisce la latency senza calcolo manuale seq/ack.
+"""
+
+import subprocess
 import argparse
 import os
 import json
+import csv
+import threading
+from collections import defaultdict
+import sys
+import time
 
 VERBOSE = False
-MAX_PERIOD = 30.0
-MIN_BPS = 0.01
+MAX_PERIOD = 1.0
+MIN_BPS    = 0.01
 
 def debug(msg):
     if VERBOSE:
-        print(f'(NetMetricsCalculator) --> {msg}')
+        print(f'(NetMetrics) --> {msg}')
 
-##############################################################################
-##########               Latency (Packet delivery time)             ##########
-##############################################################################
-def get_fwd_timestamps(packets, src, dst, dest_port):
-    timestamps = []
-    for packet in packets:
-        if IP in packet and TCP in packet:
-            if packet[IP].src != src:
-                continue  # Skip packets not matching the source host
-            if packet[IP].dst != dst or packet[IP].payload.dport != dest_port:
-                continue  # Skip packets not matching the destination host
-            timestamps.append((packet.time, packet[IP].payload.seq))
-    timestamps.sort(key=lambda x: (x[1], x[0]))  # order by #Seq
-    i = 1
-    while i < len(timestamps):
-        if timestamps[i][1] == timestamps[i - 1][1]:
-            debug(f"{timestamps[i - 1]} and {timestamps[i]} are same, deleting second!")
-            del timestamps[i]
-        else:
-            i = i + 1
-    return timestamps
+# ===========================================================================
+# SEZIONE 0: estrazione campi dal pcap tramite tshark (sostituisce rdpcap)
+# ===========================================================================
 
-def get_bwd_timestamps(packets, src, dst, source_port):
-    timestamps = []
-    already_found_ack = []
-    already_found_ack_index = []    # array to store the index in the timestamps array where to store the element
-    index = 0
-    for packet in packets:
-        do_append = True
-        reuse_index = 0
-        if IP in packet and TCP in packet:
-            if packet[IP].src != src or packet[IP].payload.sport != source_port:
-                continue  # Skip packets not matching the source host
-            if packet[IP].dst != dst:
-                continue  # Skip packets not matching the destination host
-            curr_ack = packet[IP].payload.ack
-            if curr_ack == 0:
-                continue  # Skip Pure ACK
-            if already_found_ack.count(curr_ack) > 0:
-                #   If packet already sniffed (by receiver's interface), reuse its index to store sender's interface information
-                reuse_index = already_found_ack_index[already_found_ack.index(curr_ack)]
-                do_append = False
-            if do_append:
-                #   If first sniffing
-                already_found_ack.append(curr_ack)
-                already_found_ack_index.append(index)
-                timestamps.append((packet.time, curr_ack))
-                index += 1
-            else:
-                #   If second sniffing
-                if timestamps[reuse_index][0] < packet.time:
-                    timestamps[reuse_index] = (packet.time, curr_ack)
-    timestamps.sort(key=lambda x: (x[1], x[0]))  # order by #Ack
-    return timestamps
+_TSHARK_FIELDS = [
+    'ip.src', 'ip.dst',
+    'tcp.srcport', 'tcp.dstport',
+    'tcp.seq', 'tcp.ack',
+    'tcp.flags.ack',         # 0 o 1
+    'tcp.len',               # payload TCP (no header)
+    'frame.len',             # frame completo
+    'frame.time_epoch',      # timestamp epoch
+    'tcp.analysis.ack_rtt',  # RTT data→ACK calcolato da tshark (su pacchetti ACK)
+]
 
-def calculate_latency(packets, host=None, server=None, server_port=None):
-    total_latency_ms = 0
+def read_pcap_tshark(pcap_file):
+    """
+    Estrae i campi TCP dal pcap tramite tshark.
+    Restituisce list[dict]. Molto più veloce di Scapy rdpcap().
+    Usa subprocess list (no shell=True) per evitare problemi con il separatore \t.
+    """
+    cmd = (
+        ['tshark', '-r', pcap_file, '-Y', 'tcp', '-T', 'fields']
+        + [arg for f in _TSHARK_FIELDS for arg in ('-e', f)]
+        + ['-E', 'separator=\t', '-E', 'header=y', '-E', 'occurrence=f']
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    rows = []
+    lines = result.stdout.splitlines()
+    if len(lines) < 2:
+        return rows
+    header = lines[0].split('\t')
+    for line in lines[1:]:
+        parts = line.split('\t')
+        if len(parts) < len(header):
+            continue
+        rows.append(dict(zip(header, parts)))
+    return rows
 
-    fwd_timestamps = get_fwd_timestamps(packets, host, server, server_port)
-    fwd_packet_count = len(fwd_timestamps)
 
-    bwd_timestamps = get_bwd_timestamps(packets, server, host, server_port)
-    bwd_packet_count = len(bwd_timestamps)
+# ===========================================================================
+# SEZIONE 1: calcolo metriche di rete (latency, jitter, throughput, APTT)
+# ===========================================================================
 
-    packet_count = min(fwd_packet_count, bwd_packet_count)
-
-    packets_latencies = []
-
-    if fwd_packet_count > 0:
-        j = 0
-        i = 0
-        while i < bwd_packet_count:
-            if j >= fwd_packet_count:
-                debug('Break')
-                break
-            debug(f'Packet {i}: {bwd_timestamps[i]} - {fwd_timestamps[j]} = {bwd_timestamps[i][0] - fwd_timestamps[j][0]}')
-            if i == 0:
-                latency_ms = bwd_timestamps[i][0] - fwd_timestamps[j][0]
-                packets_latencies.append(latency_ms)
-                debug('Calculated')
-                i = i + 1
-            else:
-                if bwd_timestamps[i - 1][1] == fwd_timestamps[j][1]:
-                    latency_ms = bwd_timestamps[i][0] - fwd_timestamps[j][0]
-                    packets_latencies.append(latency_ms)
-                    debug('Calculated')
-                    i = i + 1
-                else:
-                    debug('Skipped')
-            j = j+1
-        total_latency_ms = sum(packets_latencies)
-
-    if packet_count > 0:
-        average_latency_ms = total_latency_ms / packet_count
-        average_latency_s = (total_latency_ms/1000.0) / packet_count
-        print(f"(NetMetricsCalculator) --> Average latency: {average_latency_s} seconds ({average_latency_ms} ms) for {packet_count} packets")
-        return min(average_latency_s, MAX_PERIOD)
-    else:
-        print("(NetMetricsCalculator) --> No relevant packets found in the PCAP file.")
+def calculate_latency(rows, host, server, server_port):
+    """
+    Usa tcp.analysis.ack_rtt (campo nativo tshark) per la latency.
+    Il campo è presente sugli ACK server→client che riconoscono i dati del client.
+    Equivalente al calcolo manuale seq/ack del codice precedente, ma senza iterare
+    due volte sul pcap.
+    """
+    rtts = []
+    sp = str(server_port)
+    for row in rows:
+        if (row.get('ip.src') != server or
+                row.get('ip.dst') != host or
+                row.get('tcp.srcport') != sp):
+            continue
+        rtt_str = row.get('tcp.analysis.ack_rtt', '')
+        if not rtt_str:
+            continue
+        try:
+            rtt = float(rtt_str)
+            if 0 < rtt < MAX_PERIOD:
+                rtts.append(rtt)
+        except ValueError:
+            pass
+    if rtts:
+        avg = sum(rtts) / len(rtts)
+        print(f"(NetMetrics) --> Latency: {avg:.6f}s over {len(rtts)} RTT samples for {host}")
+        return min(avg, MAX_PERIOD)
+    print(f"(NetMetrics) --> Latency: no tcp.analysis.ack_rtt for {host}, using MAX_PERIOD")
     return MAX_PERIOD
 
-##############################################################################
-##########          Average Packet Transmission Time (APTT)         ##########
-##############################################################################
-def calculate_average_packet_transmission_time(packets, src, dst, dest_port, avg_packet_size_bytes, period_s):
-    packet_count = 0
-    total_sent_packets_bytes = 0
-    already_found_seq = []
-    for packet in packets:
-        if IP in packet and TCP in packet:
-            if packet[IP].src != src:
-                continue  # Skip packets not matching the source host
-            if packet[IP].dst != dst or packet[IP].payload.dport != dest_port:
-                continue  # Skip packets not matching the destination host
-            curr_seq = packet[IP].payload.seq
-            if already_found_seq.count(curr_seq) > 0:
-                continue  # Skip repeated packets
-            packet_count = packet_count + 1
-            already_found_seq.append(curr_seq)
-            total_sent_packets_bytes = total_sent_packets_bytes + len(packet)
-    if packet_count > 0:
-        debug(f'Total sent bytes = {total_sent_packets_bytes}')
-        avg_packet_transmission_time_s = avg_packet_size_bytes / (total_sent_packets_bytes / period_s)
-        print(f"(NetMetricsCalculator) --> Average Packet Transmission Time (APTT): {avg_packet_transmission_time_s} seconds ({avg_packet_transmission_time_s * 1000} ms) for {period_s} seconds")
-        return min(avg_packet_transmission_time_s, MAX_PERIOD)
-    else:
-        print("(NetMetricsCalculator) --> No relevant packets found in the PCAP file.")
+
+def calculate_aptt(rows, src, dst, dport, avg_pkt_size, period_s):
+    total_bytes = 0
+    seen_seq = set()  # (sport, seq) per distinguere connessioni TCP diverse
+    dp = str(dport)
+    for row in rows:
+        if (row.get('ip.src') != src or
+                row.get('ip.dst') != dst or
+                row.get('tcp.dstport') != dp):
+            continue
+        seq = row.get('tcp.seq', '')
+        sport = row.get('tcp.srcport', '')
+        if not seq:
+            continue
+        key = (sport, seq)
+        if key in seen_seq:
+            continue
+        seen_seq.add(key)
+        try:
+            total_bytes += int(row.get('frame.len', 0) or 0)
+        except ValueError:
+            pass
+    if total_bytes > 0:
+        aptt = avg_pkt_size / (total_bytes / period_s)
+        print(f"(NetMetrics) --> APTT: {aptt:.6f}s")
+        return min(aptt, MAX_PERIOD)
     return MAX_PERIOD
 
-##############################################################################
-##########                  Throughput                              ##########
-##############################################################################
-def calculate_throughput(packets, src, dst, dest_port, period_s):
-    packet_count = 0
-    total_sent_packets_bytes = 0
-    already_found_seq = []
-    for packet in packets:
-        if IP in packet and TCP in packet:
-            if packet[IP].src != src:
-                continue  # Skip packets not matching the source host
-            if packet[IP].dst != dst or packet[IP].payload.dport != dest_port:
-                continue  # Skip packets not matching the destination host
-            curr_seq = packet[IP].payload.seq
-            if already_found_seq.count(curr_seq) > 0:
-                continue  # Skip repeated packets
-            packet_count = packet_count + 1
-            already_found_seq.append(curr_seq)
-            total_sent_packets_bytes = total_sent_packets_bytes + len(packet)
-    if packet_count > 0:
-        debug(f'Total sent bytes = {total_sent_packets_bytes}')
-        throughput_bps = (total_sent_packets_bytes * 8) / period_s
-        print(f"(NetMetricsCalculator) --> Throughput: {throughput_bps} bps for {period_s} seconds")
-        return max(throughput_bps, MIN_BPS)
-    else:
-        print("(NetMetricsCalculator) --> No relevant packets found in the PCAP file.")
+
+def calculate_throughput(rows, src, dst, dport, period_s):
+    total_bytes = 0
+    seen_seq = set()  # (sport, seq) per distinguere connessioni TCP diverse
+    dp = str(dport)
+    for row in rows:
+        if (row.get('ip.src') != src or
+                row.get('ip.dst') != dst or
+                row.get('tcp.dstport') != dp):
+            continue
+        seq = row.get('tcp.seq', '')
+        sport = row.get('tcp.srcport', '')
+        if not seq:
+            continue
+        key = (sport, seq)
+        if key in seen_seq:
+            continue
+        seen_seq.add(key)
+        try:
+            total_bytes += int(row.get('frame.len', 0) or 0)
+        except ValueError:
+            pass
+    if total_bytes > 0:
+        bps = (total_bytes * 8) / period_s
+        print(f"(NetMetrics) --> Throughput: {bps:.1f} bps")
+        return max(bps, MIN_BPS)
     return MIN_BPS
 
-##############################################################################
-##########                      Jitter                              ##########
-##############################################################################
-def get_fwd_repeated_timestamps(packets, src, dst, dest_port):
+
+def calculate_jitter(rows, src, dst, dport):
     timestamps = []
-    for packet in packets:
-        if IP in packet and TCP in packet:
-            if packet[IP].src != src:
-                continue  # Skip packets not matching the source host
-            if packet[IP].dst != dst or packet[IP].payload.dport != dest_port:
-                continue  # Skip packets not matching the destination host
-            curr_seq = packet[IP].payload.seq
-            timestamps.append((packet.time, packet[IP].payload.seq))
-    timestamps.sort(key=lambda x: (x[1], x[0]))  # order by #Seq
-    return timestamps
+    seen_seq = set()  # (sport, seq) per distinguere connessioni TCP diverse
+    dp = str(dport)
+    for row in rows:
+        if (row.get('ip.src') != src or
+                row.get('ip.dst') != dst or
+                row.get('tcp.dstport') != dp):
+            continue
+        seq = row.get('tcp.seq', '')
+        sport = row.get('tcp.srcport', '')
+        if not seq:
+            continue
+        key = (sport, seq)
+        if key in seen_seq:
+            continue
+        seen_seq.add(key)
+        try:
+            timestamps.append(float(row['frame.time_epoch']))
+        except (ValueError, KeyError):
+            pass
+    if len(timestamps) < 2:
+        print(f"(NetMetrics) --> Jitter: not enough packets for {src}, using MAX_PERIOD")
+        return MAX_PERIOD
+    timestamps.sort()
+    deltas = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
+    avg_jitter = sum(deltas) / len(deltas)
+    print(f"(NetMetrics) --> Jitter: {avg_jitter:.6f}s")
+    return min(avg_jitter, MAX_PERIOD)
 
-def calculate_jitter(packets, src, dst, dest_port):
-    fwd_timestamps = get_fwd_repeated_timestamps(packets, src, dst, dest_port)
-    packet_count = len(fwd_timestamps)
 
-    if packet_count > 0:
-        total_jitter_ms = 0
-        i = 1
-        while i < packet_count:
-            if fwd_timestamps[i][1] != fwd_timestamps[i - 1][1]:
-                # In case of a packet captured by interface if-sender but not in if-receiver (and vice-vesa)
-                debug(f'Ignoring packet {i}')
-                i += 1
-                continue
-            time_between_packets = fwd_timestamps[i][0] - fwd_timestamps[i - 1][0]
-            debug(f'Packet {i}: {fwd_timestamps[i]} - {fwd_timestamps[i - 1]} = {time_between_packets}  ms')
-            total_jitter_ms = total_jitter_ms + time_between_packets
-            i += 2
-        avg_jitter_ms = total_jitter_ms / (packet_count / 2)
-        avg_jitter_s = avg_jitter_ms / 1000
-        print(f"(NetMetricsCalculator) --> Average jitter: {avg_jitter_s} seconds ({avg_jitter_ms} ms) for {packet_count} packets")
-        return min(avg_jitter_s, MAX_PERIOD)
-    else:
-        print("(NetMetricsCalculator) --> No relevant packets found in the PCAP file.")
-    return MAX_PERIOD
+def calculate_metrics_for_host(data, rows, ip, server_ip, server_port,
+                                pkt_size, duration_s):
+    print(f"(NetMetrics) --> Processing host {ip}")
+    data[ip] = {
+        "avg_latency_s":                  calculate_latency(rows, ip, server_ip, server_port),
+        "avg_packet_transmission_time_s": calculate_aptt(rows, ip, server_ip, server_port, pkt_size, duration_s),
+        "throughput_bps":                 calculate_throughput(rows, ip, server_ip, server_port, duration_s),
+        "avg_jitter_s":                   calculate_jitter(rows, ip, server_ip, server_port),
+    }
+    print(f"(NetMetrics) <-- Host {ip} done: {data[ip]}")
 
-def calculate_metrics(data, packets, ip, server_ip, server_port, packet_size_bytes, sending_duration_seconds):
-    print(f"(NetMetricsCalculator) --> Host {ip} started")
-    data[ip] = {}
-    data[ip]["avg_latency_s"] = calculate_latency(packets, ip, server_ip, server_port)
-    data[ip]["avg_packet_transmission_time_s"] = calculate_average_packet_transmission_time(packets, ip, server_ip,
-                                                                                            server_port,
-                                                                                            packet_size_bytes,
-                                                                                            sending_duration_seconds)
-    data[ip]["throughput_bps"] = calculate_throughput(packets, ip, server_ip, server_port, sending_duration_seconds)
-    data[ip]["avg_jitter_s"] = calculate_jitter(packets, ip, server_ip, server_port)
-    print(f"(NetMetricsCalculator) <-- Host {ip} finished")
+
+# ===========================================================================
+# SEZIONE 2: calcolo colonne equivalenti a CICFlowMeter
+# ===========================================================================
+
+def build_cic_equivalent(rows, duration_s):
+    """
+    Costruisce una lista di dizionari con le stesse colonne usate da
+    Environment.py quando legge il CSV di CICFlowMeter.
+    Due passate sui rows (list di dict) invece di tre sullo stesso pcap Scapy.
+    """
+    flows = defaultdict(lambda: {
+        'fwd_pkts': 0, 'bwd_pkts': 0,
+        'fwd_bytes': 0, 'bwd_bytes': 0,
+        'ack_flags': 0,
+    })
+
+    # Pass 1: pacchetti forward
+    for row in rows:
+        src   = row.get('ip.src', '')
+        dst   = row.get('ip.dst', '')
+        dport = row.get('tcp.dstport', '')
+        if not src or not dst or not dport:
+            continue
+        pkt_len = int(row.get('frame.len', 0) or 0)
+        flows[(src, dst, dport)]['fwd_pkts']  += 1
+        flows[(src, dst, dport)]['fwd_bytes'] += pkt_len
+
+    # Pass 2: pacchetti backward (ACK) rispetto ai flussi forward già noti
+    for row in rows:
+        src   = row.get('ip.src', '')
+        dst   = row.get('ip.dst', '')
+        sport = row.get('tcp.srcport', '')
+        dport = row.get('tcp.dstport', '')
+        if not src or not dst or not sport:
+            continue
+        pkt_len = int(row.get('frame.len', 0) or 0)
+        ack_val = row.get('tcp.flags.ack', '0')
+        is_ack  = ack_val in ('1', 'True', 'true')
+        # Il backward di (dst→src:sport) corrisponde al flusso forward (dst, src, sport)
+        fwd_key = (dst, src, sport)
+        if fwd_key in flows:
+            flows[fwd_key]['bwd_pkts']  += 1
+            flows[fwd_key]['bwd_bytes'] += pkt_len
+            if is_ack:
+                flows[fwd_key]['ack_flags'] += 1
+
+        # Controlla anche flusso con dport invertito per maggiore copertura
+        fwd_key2 = (dst, src, dport)
+        if fwd_key2 in flows and fwd_key2 != fwd_key:
+            flows[fwd_key2]['bwd_pkts']  += 1
+            flows[fwd_key2]['bwd_bytes'] += pkt_len
+            if is_ack:
+                flows[fwd_key2]['ack_flags'] += 1
+    result = []
+    for (src, dst, dport), f in flows.items():
+        if f['fwd_pkts'] == 0 or duration_s == 0:
+            continue
+        result.append({
+            'Src IP':          src,
+            'Dst IP':          dst,
+            'Dst Port':        str(dport),
+            'Flow Pkts/s':     str(f['fwd_pkts']  / duration_s),
+            'Flow Byts/s':     str(f['fwd_bytes']  / duration_s),
+            'Tot Fwd Pkts':    str(f['fwd_pkts']),
+            'Tot Bwd Pkts':    str(f['bwd_pkts']),
+            'TotLen Fwd Pkts': str(f['fwd_bytes']),
+            'TotLen Bwd Pkts': str(f['bwd_bytes']),
+            'ACK Flag Cnt':    str(f['ack_flags']),
+        })
+    return result
+
+
+def write_cic_csv(rows, output_path):
+    """Scrive il CSV nello stesso formato letto da Environment.read_cic_flow_file()."""
+    fieldnames = [
+        'Src IP', 'Dst IP', 'Dst Port',
+        'Flow Pkts/s', 'Flow Byts/s',
+        'Tot Fwd Pkts', 'Tot Bwd Pkts',
+        'TotLen Fwd Pkts', 'TotLen Bwd Pkts',
+        'ACK Flag Cnt',
+    ]
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"(NetMetrics) --> CIC-equivalent CSV written: {output_path} ({len(rows)} flows)")
+
+
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="PCAP Parser",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-s", "--server-ip", help="Server IP. E.g: 10.0.1.101", required=True)
-    parser.add_argument("-p", "--server-port", help="Server Port. E.g: 80", required=True)
-    parser.add_argument("-hip", "--hosts-ips", help="Hosts IPs. E.g: [10.0.1.1,10.0.1.2]", required=True)
-    parser.add_argument("-t", "--sending-duration-seconds", help="Sending duration in seconds. E.g: 40", required=True)
-    parser.add_argument("-b", "--packet-size-bytes", help="Average packet size in bytes. E.g: 512", required=True)
-    parser.add_argument("-aux", "--auxiliary-file", action="store_true", help="Whether to use testing file or not")
-    parser.add_argument("-nr", "--no-results", action="store_true", help="Whether to ignore generating JSON results file")
+    parser = argparse.ArgumentParser(
+        description="NetMetricsCalculator — replaces CICFlowMeter",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-s",    "--server-ip",                required=True)
+    parser.add_argument("-p",    "--server-port",              required=True)
+    parser.add_argument("-hip",  "--hosts-ips",                required=True,
+                        help="E.g: [10.0.1.1,10.0.1.2]")
+    parser.add_argument("-t",    "--sending-duration-seconds", required=True)
+    parser.add_argument("-b",    "--packet-size-bytes",        required=True)
+    parser.add_argument("-cic",  "--cic-output-path",          required=False,
+                        default="",
+                        help="Percorso dove scrivere il CSV equivalente a CICFlowMeter")
+    parser.add_argument("-pcap", "--pcap-path",                required=False,
+                        default="/tmp/qosentry/tshark_out.pcap",
+                        help="Percorso del file pcap da analizzare")
+    parser.add_argument("-nr",   "--no-results", action="store_true")
 
-    config = vars(parser.parse_args())
+    cfg = vars(parser.parse_args())
 
-    server_ip = config['server_ip']
-    server_port = int(config['server_port'])
-    hosts_ips = config['hosts_ips'].lstrip("[").rstrip("]").split(',')
-    sending_duration_seconds = int(config['sending_duration_seconds'])
-    packet_size_bytes = int(config['packet_size_bytes'])
+    server_ip    = cfg['server_ip']
+    server_port  = int(cfg['server_port'])
+    hosts_ips    = cfg['hosts_ips'].lstrip("[").rstrip("]").split(',')
+    duration_s   = int(cfg['sending_duration_seconds'])
+    pkt_size     = int(cfg['packet_size_bytes'])
+    cic_out_path = cfg['cic_output_path']
+    pcap_file    = cfg['pcap_path']
 
+    tmp_dir      = os.environ.get('QOSENTRY_TMP', '/tmp/qosentry')
+    metrics_data = {}
 
-    pcap_file = '/home/mininet-user/mainproject/reinforcement/tmp/tshark_out.pcap'
-    if config['auxiliary_file']:
-        pcap_file = '/home/mininet-user/tshark-out/backup_test.pcap'
+    def _write_defaults():
+        for ip in hosts_ips:
+            metrics_data[ip.strip()] = {
+                "avg_latency_s": 1.0,
+                "avg_packet_transmission_time_s": 1.0,
+                "throughput_bps": 0.01,
+                "avg_jitter_s": 1.0,
+            }
 
-    print(f"(NetMetricsCalculator) --> Reading pcap file at {pcap_file}")
+    print(f"(NetMetrics) --> Reading pcap: {pcap_file}")
+    if not os.path.exists(pcap_file):
+        print(f"(NetMetrics) ERROR: pcap not found: {pcap_file}")
+        _write_defaults()
+        if cic_out_path:
+            write_cic_csv([], cic_out_path)
+        if not cfg['no_results']:
+            os.makedirs(tmp_dir, exist_ok=True)
+            with open(os.path.join(tmp_dir, 'metrics.json'), 'w') as f:
+                json.dump(metrics_data, f, indent=2)
+        sys.exit(0)
 
-    packets = rdpcap(pcap_file)
+    tshark_start = time.time()
+    rows = read_pcap_tshark(pcap_file)
+    print(f"(NetMetrics) --> {len(rows)} TCP rows extracted in {time.time() - tshark_start:.2f}s")
 
-    data = {}
+    if not rows:
+        print("(NetMetrics) WARNING: no TCP packets found, using defaults")
+        _write_defaults()
+        if cic_out_path:
+            write_cic_csv([], cic_out_path)
+        if not cfg['no_results']:
+            os.makedirs(tmp_dir, exist_ok=True)
+            with open(os.path.join(tmp_dir, 'metrics.json'), 'w') as f:
+                json.dump(metrics_data, f, indent=2)
+        sys.exit(0)
 
+    # --- Sezione 1: metriche per host (parallele) ---
+    metrics_start = time.time()
     threads = []
     for ip in hosts_ips:
-        t = threading.Thread(name=f'thr-{ip}',
-                            target=calculate_metrics,
-                            args=(data, packets, ip, server_ip, server_port, packet_size_bytes, sending_duration_seconds))
+        ip = ip.strip()
+        t = threading.Thread(
+            name=f'thr-{ip}',
+            target=calculate_metrics_for_host,
+            args=(metrics_data, rows, ip, server_ip, server_port, pkt_size, duration_s)
+        )
         threads.append(t)
         t.start()
-    for thread in threads:
-        thread.join()
-    print(data)
+    for t in threads:
+        t.join(timeout=60)
+        if t.is_alive():
+            print(f"(NetMetrics) WARNING: thread {t.name} timed out, using defaults")
+    print(f"(NetMetrics) --> Metrics calculation: {time.time() - metrics_start:.2f}s")
 
-    tmp_dir = os.path.dirname(os.path.abspath(__file__)) + '/tmp'
-    metrics_file = f'{tmp_dir}/metrics.json'
+    # --- Sezione 2: CIC-equivalent CSV ---
+    if cic_out_path:
+        cic_start = time.time()
+        cic_rows = build_cic_equivalent(rows, duration_s)
+        write_cic_csv(cic_rows, cic_out_path)
+        print(f"(NetMetrics) --> CIC CSV generation: {time.time() - cic_start:.2f}s")
 
-    # Serializing json
-    json_object = json.dumps(data, indent=2)
+    print(metrics_data)
 
-    if not config['no_results']:
-        # Writing to sample.json
-        with open(metrics_file, "w") as outfile:
-            outfile.write(json_object)
-        print(f'(NetMetricsCalculator) <--> File {metrics_file} created...')
+    if not cfg['no_results']:
+        metrics_file = os.path.join(tmp_dir, 'metrics.json')
+        os.makedirs(tmp_dir, exist_ok=True)
+        for _ip in hosts_ips:
+            _ip = _ip.strip()
+            if _ip not in metrics_data:
+                print(f"(NetMetrics) WARNING: no data for {_ip}, using defaults")
+                metrics_data[_ip] = {
+                    "avg_latency_s": 1.0,
+                    "avg_packet_transmission_time_s": 1.0,
+                    "throughput_bps": 0.01,
+                    "avg_jitter_s": 1.0,
+                }
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics_data, f, indent=2, default=str)
+        print(f"(NetMetrics) --> metrics.json written: {metrics_file}")
