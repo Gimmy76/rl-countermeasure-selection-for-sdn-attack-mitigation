@@ -9,6 +9,16 @@ from intermed.OvsIntermediateMininet import *
 from intermed.OvsIntermediate import *
 from intermed import OvsIntermediateConstants as consts
 
+import os
+TRIAL_SUFFIX = os.environ.get("TRIAL_ID", "").replace("_t", "t")
+
+def get_switch_name(base_name):
+    import os
+    suffix = os.environ.get("TRIAL_ID", "").replace("_", "")
+    return f"{base_name}{suffix}"
+
+
+
 # =========================================================================================
 # =============================== Environment Variables ===================================
 # =========================================================================================
@@ -28,6 +38,9 @@ if xterm_to_file:
 
 class GlobalsHolder:
     def __init__(self, config):
+        import os as _os
+        self.instance_id = _os.getenv("INSTANCE_ID", "qos")
+        print(f"INFO: QoSentry instance_id = {self.instance_id}")
         self.net = None
         self.cli = None
         self.max_host_bw = 3.1
@@ -91,9 +104,12 @@ class GlobalsHolder:
         self.controlled_switch_flood_priority = 0
         self.controlled_switch_arp_priority = 499
         self.non_controlled_switch_arp_priority = 499
-
-        self.s0_switch = "s0"
+        import os as _sw_os
+        _sw = _sw_os.getenv("SWITCH_SUFFIX", "")
+        self.s0_switch = f"s0{_sw}" if _sw else "s0" 
         self.server_host = self.servers[0]
+
+
         self.global_dns = "8.8.8.8"
 
         self.do_validity_controls()
@@ -123,6 +139,8 @@ class GlobalsHolder:
             raise Exception(f"Number of controlled switches set to a ({self.nbr_controlled_switches}) which is more than 99. max value is 99!")
 
     def read_hosts_topology_file(self):
+        import os as _os
+        _sfx = _os.getenv("TRIAL_ID", "").replace("_t", "t")
         print(f"-> Reading hosts from {self.hosts_topo_file_path}")
         with open(self.hosts_topo_file_path) as json_file:
             data = json.load(json_file)
@@ -132,15 +150,23 @@ class GlobalsHolder:
             if not host.startswith("h"):
                 raise Exception(f"Host name ({host}) is not valid, accepted format 'h' + (number), example: 'h76'")
             self.client_hosts_list.append(host)
-            self.host_default_switch_relation[host] = {'default_path_switch': self.hosts_raw_topo[host]['default_path_switch']}
-            router = self.hosts_raw_topo[host]['router_switch']
-            self.router_to_host_relation[router] = {'host': host}
-            self.router_switches_list.append(router)
-            self.router_to_controlled_switch_relation[router] = {'controlled_switch': self.hosts_raw_topo[host]['default_path_switch']}
-            if self.hosts_raw_topo[host]['default_path_switch'] in self.controlled_switch_to_router_relation:
-                self.controlled_switch_to_router_relation[self.hosts_raw_topo[host]['default_path_switch']]['routers'].append(router)
+            # Applica suffisso a tutti i nomi degli switch
+            _dp = self.hosts_raw_topo[host]['default_path_switch']
+            _dp_sfx = f"{_dp}{_sfx}" if _sfx else _dp
+            _router = self.hosts_raw_topo[host]['router_switch']
+            _router_sfx = f"{_router}{_sfx}" if _sfx else _router
+            self.host_default_switch_relation[host] = {'default_path_switch': _dp_sfx}
+            self.router_to_host_relation[_router_sfx] = {'host': host}
+            self.router_switches_list.append(_router_sfx)
+            self.router_to_controlled_switch_relation[_router_sfx] = {'controlled_switch': _dp_sfx}
+            if _dp_sfx in self.controlled_switch_to_router_relation:
+                self.controlled_switch_to_router_relation[_dp_sfx]['routers'].append(_router_sfx)
             else:
-                self.controlled_switch_to_router_relation[self.hosts_raw_topo[host]['default_path_switch']] = {'routers': [router]}
+                self.controlled_switch_to_router_relation[_dp_sfx] = {'routers': [_router_sfx]}
+            # Aggiorna hosts_raw_topo con suffisso
+            if _sfx:
+                self.hosts_raw_topo[host]['router_switch'] = _router_sfx
+                self.hosts_raw_topo[host]['default_path_switch'] = _dp_sfx
 
 
 def init(config):
@@ -182,11 +208,10 @@ def turn_up_link(src_switch, src_int, dst_switch, dst_int):
     info(GLOBALS.net[dst_switch].cmd(f'ifconfig {dst_int} up'))
 
 def get_interface_name(src, dst):
-    if dst.startswith("s"):
-        return f'{src}-eth{dst.lstrip("s")}'
-    if dst.startswith("h"):
-        return f'{src}-eth{dst.lstrip("h")}'
-    return f"{src}-eth{dst}"
+    import re
+    m = re.match(r'^[a-zA-Z]+([0-9]+)', dst)
+    num = m.group(1) if m else dst
+    return f'{src}-eth{num}'
 # These functions generate Open vSwitch (OVS) flow rules for packet forwarding.
 # They generate rules based on different criteria like:
 # - Source IP
