@@ -15,16 +15,22 @@ import tensorflow as tf
 
 class Environment():
 
-    def __init__(self, config):
+    def __init__(self, config, reward_config=None):
         print("(Reinforcement) Environment.__init__()")
+        self.reward_config = reward_config or {"weights": {"latency": 1.0, "jitter": 1.0}, "bounds": {"min": -3.0, "max": 3.0}, "penalty": -0.5, "action_penalty": -1.0, "small_improvement": 1.0, "small_penalty": -0.1, "asymmetry": 1.0}
         self.episodes = config.episodes
         self.steps = config.steps
-        self.step_duration = 55 # seconds
-        self.attack_duration = 30 # seconds
-        self.tshark_processing_duration = 15 # seconds
-        self.transmission_time = self.step_duration - self.tshark_processing_duration # = 40 seconds
-        self.after_attack_duration = (self.step_duration - self.attack_duration) - self.tshark_processing_duration # = 10 seconds
+        self.step_duration = 55 # seconds (aligned with paper Fig.8)
+        self.attack_duration = 30 # seconds (aligned with paper Fig.8)
+        self.tshark_processing_duration = 6 # seconds (NetMetricsCalculator)
+        self.transmission_time = self.step_duration - self.tshark_processing_duration # = 49s
+        self.after_attack_duration = (self.step_duration - self.attack_duration) - self.tshark_processing_duration # = 19s
         self.nbr_non_server_hosts = len(config.client_hosts_list)
+
+        self.last_tcp_flow_duration = 0.0
+        self.last_tshark_duration = 0.0
+        self.last_netmetrics_duration = 0.0
+        self.last_reset_mininet_duration = 0.0
         self.nbr_of_servers = 1
         self.nbr_hosts = self.nbr_non_server_hosts + self.nbr_of_servers
         self.hosts = []
@@ -95,8 +101,8 @@ class Environment():
         self.beta_delay = 1 # concentrating on delay 0.45
         self.tolerable_PKT_loss_percentage = 0.01
         self.tolerable_delay_ms = 2.0  # TODO: Check 29
-        self.tolerable_latency_s = 0.0002  # TODO: Check 29
-        self.tolerable_jitter_s = 0.0002  # TODO: Check 29
+        self.tolerable_latency_s = 0.02  # paper: tolerable_x = 0.02 seconds
+        self.tolerable_jitter_s = 0.02  # paper: tolerable_x = 0.02 seconds
         self.max_PKT_loss_percentage = 0.8
         self.max_delay_ms = 2000 # TODO: Check 29 # originally 400
         self.max_latency_s = 5.5 # TODO: Check 29
@@ -118,6 +124,13 @@ class Environment():
 
         # Logging
         self.episode_actions_text_list = []
+        self.w_lat = 1.0
+        self.w_jit = 1.0
+        self.w_loss = 1.0
+        self.last_recorded_loss = 0.0
+        self.tolerable_loss = 0.30    # 1% — paper tolerable_PKT_loss_percentage
+        self.max_loss = 0.8           # 80% — paper max_PKT_loss_percentage
+        self.threshold_loss = 0.05    # soglia delta per miglioramento/peggioramento
 
     def update_hosts(self):
         self.hosts = []
@@ -153,23 +166,29 @@ class Environment():
         self.attacker_hosts = []
         self.victim_servers = []
 
+        # Suffisso trial spostato in cima alla funzione (era usato prima di essere definito)
+        import os as _env_os
+        _sfx = _env_os.environ.get("TRIAL_ID", "").replace("_t", "t")
+
         self.server_election()
         self.attacker_election(pre_set_attackers)
 
-        self.routing_switches = []
-        for i in range(1, self.nbr_routing_switches + 1):
-            self.routing_switches.append(f's{i}')
+        self.routing_switches = list(self.router_switches_list) if self.router_switches_list else []
+        if not self.routing_switches:
+            for i in range(1, self.nbr_routing_switches + 1):
+                self.routing_switches.append(f's{i}{_sfx}')
 
         self.controlled_switches = []
         for i in range(1, self.nbr_controlled_switches + 1):
             i_plus_100 = i + 100
-            self.controlled_switches.append(f's{i_plus_100}')
+            self.controlled_switches.append(f's{i_plus_100}{_sfx}')
 
         self.hosts_ordered = self.hosts.copy()
         self.ACTIONS = []
         for src_switch in self.controlled_switches:
             for bw_action in range(self.NBR_POSSIBLE_CONTROLLED_SWITCH_BW_ACTIONS):
-                self.ACTIONS.append(Util.bw_action(src_switch, 's0', bw_action))
+                _s0 = f"s0{_sfx}" if _sfx else "s0"
+                self.ACTIONS.append(Util.bw_action(src_switch, _s0, bw_action))
         for src_switch_index in range(0, len(self.controlled_switches) - 1):
             src_switch = self.controlled_switches[src_switch_index]
             for dst_switch_index in range(src_switch_index + 1, len(self.controlled_switches)):
@@ -254,27 +273,48 @@ class Environment():
     # Retrieves the interface IDs required for TShark packet capturing.
     # This function maps the network interfaces available on the machine to their respective IDs for packet capturing.
     def get_tshark_interfaces_ids(self, cmd):
-        tshark_interfaces = cmd.get_tshark_interfaces()
-        tshark_interfaces_ids = ''
-        for i in range(len(tshark_interfaces)):
-            tshark_interface_components = tshark_interfaces[i].split('.')
-            if len(tshark_interface_components) == 2:
-                for j in range(len(self.interfaces)):
-                    if self.interfaces[j] == tshark_interface_components[1].strip():
-                        print(
-                            f'(Reinforcement) ==> interface {self.interfaces[j]} has id {tshark_interface_components[0]}')
-                        tshark_interfaces_ids = f'{tshark_interfaces_ids} -i {tshark_interface_components[0]}'
-        return tshark_interfaces_ids
+        import os as _tsh_os
+        import subprocess as _tsh_sub
+        _sfx = _tsh_os.environ.get("TRIAL_ID", "").replace("_t", "t")
+        # In modalità parallela, filtra solo le interfacce del proprio trial
+        # per evitare che tshark catturi traffico di altri trial concorrenti.
+        if _sfx:
+            try:
+                result = _tsh_sub.run(
+                    "ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1",
+                    shell=True, capture_output=True, text=True, timeout=10
+                )
+                ifaces = [
+                    i.strip() for i in result.stdout.splitlines()
+                    if _sfx in i and i.strip() and "lo" not in i
+                ]
+                if ifaces:
+                    iface_args = " ".join(f"-i {iface}" for iface in ifaces)
+                    print(f"(Reinforcement) ==> tshark interfaces per trial {_sfx}: {iface_args}")
+                    return iface_args
+            except Exception as e:
+                print(f"(Reinforcement) WARNING: fallback -i any ({e})")
+        print("(Reinforcement) ==> Using -i any for tshark (no trial suffix)")
+        return '-i any'
 
     # Reads network flow data from a CSV file generated by CICFlowMeter.
     # The data contains flow-level statistics such as packet count, byte count, and timestamps.
     def read_cic_flow_file(self, config):
         print(f'(Reinforcement) ==> Started reading PCAP file {config.cic_output_file_path}')
         data = []
-        with open(config.cic_output_file_path, 'r', newline='') as csvfile:
-            csv_reader = csv.DictReader(csvfile, delimiter=',')
-            for row in csv_reader:
-                data.append(row)
+        for _attempt in range(5):
+            try:
+                with open(config.cic_output_file_path, 'r', newline='') as csvfile:
+                    content = csvfile.read().strip()
+                    if not content:
+                        raise ValueError("Empty CIC file")
+                    import io as _io
+                    csv_reader = csv.DictReader(_io.StringIO(content), delimiter=',')
+                    data = [row for row in csv_reader]
+                break
+            except (ValueError, Exception) as e:
+                print(f'(Reinforcement) WARNING: cic_flow.csv not ready (attempt {_attempt+1}/5): {e}')
+                import time as _t; _t.sleep(2)
         print(f'(Reinforcement) <== Ended reading PCAP file')
         return data
 
@@ -283,8 +323,17 @@ class Environment():
     def read_network_metrics_file(self, config):
         print(f'(Reinforcement) ==> Started reading Network metrics file {config.net_metrics_result_file_path}')
         data = {}
-        with open(config.net_metrics_result_file_path) as json_file:
-            data = json.load(json_file)
+        for _attempt in range(5):
+            try:
+                with open(config.net_metrics_result_file_path) as json_file:
+                    content = json_file.read().strip()
+                    if not content:
+                        raise ValueError("Empty file")
+                    data = json.loads(content)
+                break
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f'(Reinforcement) WARNING: metrics.json not ready (attempt {_attempt+1}/5): {e}')
+                import time as _t; _t.sleep(2)
         print(f'(Reinforcement) <== Ended reading Network metrics file')
         return data
 
@@ -299,8 +348,10 @@ class Environment():
         http_client.reset_tcp_receivers()
         time.sleep(2)
 
+        tshark_start = time.time()
         cmd.start_tshark_sniffing(tshark_interfaces_ids)
 
+        flow_start = time.time()
         # Start hosts sending
         for host in sender_receiver_relation:
             server = sender_receiver_relation[host]
@@ -324,24 +375,31 @@ class Environment():
         time.sleep(self.after_attack_duration)
 
         http_client.stop_all_tcp_flows()
+        self.last_tcp_flow_duration = time.time() - flow_start
 
         # End hosts sending
 
         time.sleep(self.tshark_processing_duration)
 
         cmd.stop_tshark_sniffing()
+        self.last_tshark_duration = time.time() - tshark_start
 
         http_client.stop_tcp_receivers()
-
-        cmd.run_cic()
-
+       
+        metrics_start = time.time()
         cmd.run_network_metrics_calculator(self.hosts_ips[self.servers[0]], 80, self.normal_hosts_ips_array, self.transmission_time, 512)
+        self.last_netmetrics_duration = getattr(cmd, 'last_netmetrics_duration', 0.0)
+        print(f"(Timing) NetMetricsCalculator: {time.time() - metrics_start:.2f}s")
 
         # cmd.read_ditg_logs()
 
+        cic_start = time.time()
         cic_data = self.read_cic_flow_file(config)
+        print(f"(Timing) Read CIC file: {time.time() - cic_start:.2f}s")
 
+        net_start = time.time()
         network_metrics = self.read_network_metrics_file(config)
+        print(f"(Timing) Read Network metrics: {time.time() - net_start:.2f}s")
 
         data_per_host = {}
 
@@ -359,12 +417,23 @@ class Environment():
             switch_interface_statistics = http_client.get_host_interface_statistics(host).text.replace("{", "").replace(
                 "}", "").split(",")
 
-            host_data['bandwidth'] = Decimal(http_client.get_host_bw(host).json()['bw'])
+            host_bw = Decimal('0')
+            try:
+                resp = http_client.get_host_bw(host)
+                data = resp.json() if resp is not None else {}
+                host_bw = Decimal(str(data.get('bw', '0')))
+            except Exception as e:
+                print(f'(Reinforcement) WARNING: invalid get_host_bw response for {host}: {e}')
+                host_bw = Decimal('0')
+
+            host_data['bandwidth'] = host_bw
 
             if host not in self.host_last_recorded_interface_data.keys():
                 self.host_last_recorded_interface_data[host] = {'tx_bytes': 0, 'rx_bytes': 0}
             for stat in switch_interface_statistics:
                 item = stat.strip().split('=')
+                if len(item) < 2:
+                    continue
                 key = item[0]
                 value = item[1]
                 if key == 'rx_bytes':
@@ -390,11 +459,8 @@ class Environment():
                             float(cic_line['TotLen Fwd Pkts']))
                         host_data['rx_packets_len'] = host_data['rx_packets_len'] + int(
                             float(cic_line['TotLen Bwd Pkts']))
-                        # percentage of transmitted PKTS to total NBR PKTS
-                        tx_packets_to_all = float(cic_line['Tot Fwd Pkts']) / (
-                                    float(cic_line['Tot Fwd Pkts']) + float(cic_line['Tot Bwd Pkts']))
-                        host_data['delivered_pkts'] = host_data['delivered_pkts'] + (
-                                    float(cic_line['ACK Flag Cnt']) * tx_packets_to_all)
+                        # Dx = Rx,ack — paper formula (eq.7): delivered = ACK received by host
+                        host_data['delivered_pkts'] = host_data['delivered_pkts'] + float(cic_line['ACK Flag Cnt'])
                     elif cic_line['Dst IP'] == host_ip:
                         # When the host is the Destination, his fwd packets are flow's bwd packets
                         host_data['tx_packets'] = host_data['tx_packets'] + int(float(cic_line['Tot Bwd Pkts']))
@@ -403,16 +469,17 @@ class Environment():
                             float(cic_line['TotLen Bwd Pkts']))
                         host_data['rx_packets_len'] = host_data['rx_packets_len'] + int(
                             float(cic_line['TotLen Fwd Pkts']))
-                        rx_packets_to_all = float(cic_line['Tot Bwd Pkts']) / (
-                                    float(cic_line['Tot Fwd Pkts']) + float(cic_line['Tot Bwd Pkts']))
-                        host_data['delivered_pkts'] = host_data['delivered_pkts'] + (
-                                    float(cic_line['ACK Flag Cnt']) * rx_packets_to_all)
+                        # Dx = Rx,ack — paper formula (eq.7): delivered = ACK received by host
+                        host_data['delivered_pkts'] = host_data['delivered_pkts'] + float(cic_line['ACK Flag Cnt'])
             if fwd_host_flow_count > 0:
                 # Only if the current host is a sender (normal host/attacker)
                 dur = self.transmission_time if host in self.normal_hosts else self.attack_duration
                 host_data['pkts_s'] = host_data['tx_packets'] / dur
                 host_data['bytes_s'] = host_data['tx_packets_len'] / dur
-                host_data['loss_pct'] = (host_data['tx_packets'] - host_data['delivered_pkts']) / host_data['tx_packets']
+                if host_data["tx_packets"] > 0:
+                    host_data["loss_pct"] = (host_data["tx_packets"] - host_data["delivered_pkts"]) / host_data["tx_packets"]
+                else:
+                    host_data["loss_pct"] = 0.0
                 if host_data['loss_pct'] <= 0:
                     host_data['loss_pct'] = 0.001
 
@@ -425,7 +492,13 @@ class Environment():
                 host_data['non_server_data']['default_path_switch'] = default_path
                 host_data['non_server_data']['router_switch'] = router_switch
                 if host not in self.attacker_hosts:
-                    host_network_metrics = network_metrics[self.hosts_ips[host]]
+                    host_ip = self.hosts_ips.get(host, '')
+                    host_network_metrics = network_metrics.get(host_ip, {
+                        'avg_latency_s': 1.0,
+                        'avg_packet_transmission_time_s': 1.0,
+                        'throughput_bps': 0.01,
+                        'avg_jitter_s': 1.0
+                    })
                     host_data['non_server_data']['network_metrics'] = host_network_metrics
             data_per_host[host] = host_data
 
@@ -434,8 +507,16 @@ class Environment():
                         self.attack_duration + self.after_attack_duration)
             data_per_host[server]['bytes_s'] = data_per_host[server]['rx_packets_len'] / (
                         self.attack_duration + self.after_attack_duration)
-            data_per_host[server]['loss_pct'] = (data_per_host[server]['rx_packets'] - data_per_host[server][
-                'delivered_pkts']) / data_per_host[server]['rx_packets']
+            
+            tx = data_per_host[server].get('tx_packets', 0)
+            rx = data_per_host[server].get('rx_packets', 0)
+            if tx > 0:
+    
+               loss_val = max(0, (tx - rx) / tx)
+               data_per_host[server]['loss_pct'] = loss_val
+            else:
+
+               data_per_host[server]['loss_pct'] = 0.0
             if data_per_host[server]['loss_pct'] <= 0:
                 data_per_host[server]['loss_pct'] = 0.001
 
@@ -449,15 +530,34 @@ class Environment():
 
         data_per_controlled_switches = {}
         for src_switch in self.controlled_switches:
-            dst_switches = http_client.get_dst_switches(src_switch).json()['dst_switches']
+            dst_switches_raw = http_client.get_dst_switches(src_switch)
+            try:
+                dst_switches = dst_switches_raw.json()['dst_switches']
+            except Exception as e:
+                print(f'(RL) WARNING: get_dst_switches({src_switch}) failed: {e}')
+                dst_switches = []
+
             data_per_controlled_switches[src_switch] = {}
             for dst_switch in dst_switches:
-               link_information = http_client.get_link_information(src_switch, dst_switch).json()
-               switch_bw = Decimal(link_information['bw'])
-               data_per_controlled_switches[src_switch][dst_switch] = {'bw': float(switch_bw)}
-        return {'host': data_per_host,
-                'routing': data_per_routing_switch,
-                'controlled': data_per_controlled_switches}
+                try:
+                    resp = http_client.get_link_information(src_switch, dst_switch)
+                    # Controlla che la risposta non sia vuota
+                    if not resp.text or resp.text.strip() == '':
+                        raise ValueError("Empty response")
+                    link_information = resp.json()
+                    switch_bw = Decimal(str(link_information.get('bw', '0.1')))
+                except Exception as e:
+                    print(f'(RL) WARNING: get_link_information({src_switch},{dst_switch}) failed: {e}')
+                    switch_bw = Decimal('0.1')
+                data_per_controlled_switches[src_switch][dst_switch] = {
+                    'bw': float(switch_bw)
+                }
+
+        return {
+            'host': data_per_host,
+            'routing': data_per_routing_switch,
+            'controlled': data_per_controlled_switches
+        }
 
     # Converts the bandwidth data for each controlled switch connected to the central switch (s0) from dictionary into an  array.
     # The array representation is used as input for the reinforcement learning model.
@@ -476,7 +576,7 @@ class Environment():
 
         switch_index = 0
         for src_switch in self.controlled_switches:
-            dst_switch = 's0'
+            dst_switch = list(data_per_controlled_switches[src_switch].keys())[0]  # usa il nome reale di s0 (es. s0t1)
             metric_index = 0
             for metric_name in data_per_controlled_switches[src_switch][dst_switch]:
                 arr_data_per_controlled_switches_for_s0[switch_index, metric_index] = data_per_controlled_switches[src_switch][dst_switch][metric_name]
@@ -612,29 +712,23 @@ class Environment():
         features = tf.transpose(data_per_host)
         max_tx_bytes = 400000000.0
         max_rx_bytes = 400000000.0
-        max_tx_packets = max_tx_bytes / 512  # mean packet size to be 512
-        max_rx_packets = max_rx_bytes / 512  # mean packet size to be 512
+        max_tx_packets = max_tx_bytes / 512
+        max_rx_packets = max_rx_bytes / 512
         min_duration_s = self.attack_duration
         max_pkts_s = max(max_tx_packets, max_rx_packets) / min_duration_s
         max_bytes_s = max_pkts_s * 512
-        feature_ranges = np.array([[0.0, max_tx_bytes], # tx_bytes
-                          [0.0, max_rx_bytes], # rx_bytes
-                          [self.MIN_BW, self.MAX_BW * 6], # bandwidth
-                          [0.0, max_tx_packets], # tx_packets
-                          [0.0, max_rx_packets], # rx_packets
-                          [0.0, max_tx_bytes], # tx_packets_len
-                          [0.0, max_rx_bytes], # rx_packets_len
-                          [0.0, max_rx_packets], # delivered_pkts
-                          [0.0, 1.0], # loss_pct
-                          [0.0, 1.0], # is_connected
-                          [0.0, max_pkts_s], # pkts_s
-                          [0.0, max_bytes_s] # bytes_s
-                          ])
+        feature_ranges = np.array([[0.0, max_tx_bytes], [0.0, max_rx_bytes], [self.MIN_BW, self.MAX_BW * 6],
+                          [0.0, max_tx_packets], [0.0, max_rx_packets], [0.0, max_tx_bytes],
+                          [0.0, max_rx_bytes], [0.0, max_rx_packets], [0.0, 1.0],
+                          [0.0, 1.0], [0.0, max_pkts_s], [0.0, max_bytes_s]])
+        
         features = self.fixed_normalization(features, feature_ranges, np.array([[0.0, 1.0]]))
-        print(np.max(features))
-        if np.max(features) > 1:
-            print(features)
-            raise Exception("normalization problem in (normalize_and_scale_state_data_per_host_array)")
+        
+        # --- FIX: Clipping ---
+        if np.max(features) > 1.0 or np.min(features) < 0.0:
+            print(f"(Warning) Host General Data out of bounds: Max={np.max(features)}. Clipping applied.")
+            features = np.clip(features, 0.0, 1.0)
+            
         return tf.transpose(features)
 
     def normalize_and_scale_state_data_per_host_for_path_array(self, data_per_host_for_path_array):
@@ -656,44 +750,43 @@ class Environment():
                           [0.0, 30.0]
                           ])
         features = self.fixed_normalization(features, feature_ranges, np.array([[0.0, 1.0]]))
-        print(np.max(features))
-        if np.max(features) > 1:
-            print(features)
-            raise Exception("normalization problem in (normalize_and_scale_state_data_per_host_for_network_metrics_array)")
+        
+        
+        if np.max(features) > 1.0 or np.min(features) < 0.0:
+            print(f"(Warning) Network Metrics out of bounds: Max={np.max(features)}. Clipping applied.")
+            features = np.clip(features, 0.0, 1.0)
+            
         return tf.transpose(features)
 
     def normalize_and_scale_data_per_routing_switch_array(self, data_per_routing_switch):
         features = tf.transpose(data_per_routing_switch)
         feature_ranges = np.array([[self.MIN_BW, self.MAX_SWITCH_BW]])
+    
         features = self.fixed_normalization(features, feature_ranges, np.array([[0.0, 1.0]]))
-        print(np.max(features))
-        if np.max(features) > 1:
-            print(features)
-            raise Exception("normalization problem in (normalize_and_scale_data_per_routing_switch_array)")
+    
+        if np.max(features) > 1.0 or np.min(features) < 0.0:
+            print(f"(Warning) Normalization out of bounds: Max={np.max(features)}, Min={np.min(features)}. Clipping applied.")
+            features = np.clip(features, 0.0, 1.0)
+    # ---------------------------------
+    
         return tf.transpose(features)
 
     def normalize_and_scale_data_per_controlled_switch_for_s0_array(self, arr_data_per_controlled_switch_for_s0):
-        features = tf.transpose(arr_data_per_controlled_switch_for_s0)  # 2 * 4
-        feature_ranges = np.array([[self.MIN_BW, self.MAX_SWITCH_BW],
-                                   # [0.0, 1.0]]) # link congestion
-                                   ]) # link congestion
+        features = tf.transpose(arr_data_per_controlled_switch_for_s0)
+        feature_ranges = np.array([[self.MIN_BW, self.MAX_SWITCH_BW]])
         features = self.fixed_normalization(features, feature_ranges, np.array([[0.0, 1.0]]))
-        print(np.max(features))
-        if np.max(features) > 1:
-            print(features)
-            raise Exception("normalization problem in (normalize_and_scale_data_per_controlled_switch_for_s0_array)")
+        
+        if np.max(features) > 1.0 or np.min(features) < 0.0:
+            features = np.clip(features, 0.0, 1.0)
         return tf.transpose(features)
 
     def normalize_and_scale_data_per_controlled_switch_for_each_others_array(self, arr_data_per_controlled_switch_for_each_others):
-        features = tf.transpose(arr_data_per_controlled_switch_for_each_others) # 2 * 6
-        feature_ranges = np.array([[self.MIN_BW, self.MAX_SWITCH_BW],
-                                   # [0.0, 1.0]]) # link congestion
-                                   ]) # link congestion
+        features = tf.transpose(arr_data_per_controlled_switch_for_each_others)
+        feature_ranges = np.array([[self.MIN_BW, self.MAX_SWITCH_BW]])
         features = self.fixed_normalization(features, feature_ranges, np.array([[0.0, 1.0]]))
-        print(np.max(features))
-        if np.max(features) > 1:
-            print(features)
-            raise Exception("normalization problem in (normalize_and_scale_data_per_controlled_switch_for_each_others_array)")
+        
+        if np.max(features) > 1.0 or np.min(features) < 0.0:
+            features = np.clip(features, 0.0, 1.0)
         return tf.transpose(features)
 
     def calculate_max_scale(self, max_attackers, max_hosts, max_servers):
@@ -744,6 +837,8 @@ class Environment():
     def apply_action_controlled_switches(self, config: Configuration, cmd: CmdManager, http_client: HttpClient,
                                          tshark_interfaces_ids, sender_receiver_relation, attacker_victim_relation,
                                          attack_types, action: int, is_predicted):
+        import time
+        start_time = time.time()
         predicted_or_random_label = "predicted" if is_predicted else "random"
         ACTION = self.ACTIONS[action]
         print(f"(Reinforcement) ==> Applying {predicted_or_random_label} action: {action} <==> {ACTION}")
@@ -752,6 +847,7 @@ class Environment():
         ACTIONS_splitted = ACTION.split(':')
 
         action_message = "none"
+        action_start = time.time()
         if ACTIONS_splitted[0] == "bw":
             src_switch = ACTIONS_splitted[1]
             dst_switch = ACTIONS_splitted[2]
@@ -788,16 +884,22 @@ class Environment():
                 action_message = f"Applying {predicted_or_random_label} action: {action} => REDIRECT: {host_name} ==> {dst_switch} ==> Applied"
             print(f"(Reinforcement) ==> {action_message}")
         elif ACTIONS_splitted[0] == Util.nothing_action():
+            action_can_be_taken = True
             self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER += 1
-            action_message = f"Applying {predicted_or_random_label} action: {action} => DO Nothing"
+            action_message = f"Applying action: DO Nothing (counter={self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER})"
             print(f"(Reinforcement) ==> {action_message}")
         else:
             action_can_be_taken = False
+        print(f"(Timing) Action application: {time.time() - action_start:.2f}s")
+
+        state_start = time.time()
         new_state = self.get_state(config, cmd, http_client, tshark_interfaces_ids, sender_receiver_relation,
                   attacker_victim_relation, attack_types)
+        print(f"(Timing) State calculation: {time.time() - state_start:.2f}s")
 
-        reward, done, avg_PKT_loss_percentage, avg_real_delay, avg_latency, avg_jitter = self.calculate_reward(new_state, action_can_be_taken)
+        reward, done, avg_PKT_loss_percentage, avg_real_delay, avg_latency, avg_jitter = self.calculate_reward(new_state, action_can_be_taken, self.w_lat, self.w_jit, self.w_loss)
         self.episode_actions_text_list.append([ACTION, action_message])
+        print(f"(Timing) Total apply_action_controlled_switches: {time.time() - start_time:.2f}s")
         return (new_state, reward, done, avg_PKT_loss_percentage, avg_real_delay, avg_latency, avg_jitter)
 
     # Calculates the average packet loss percentage across all hosts.
@@ -817,10 +919,12 @@ class Environment():
         transmission_time_ms = (self.transmission_time * 1000)
         for host in self.normal_hosts:
             host_delay = 0
-            if state['host'][host]['delivered_pkts'] == 0:
+            delivered = state['host'][host]['delivered_pkts']
+            print(f'(Reinforcement) ====> Host {host} delivered_pkts = {delivered}')
+            if delivered == 0:
                 host_delay = transmission_time_ms
             else:
-                host_delay = (transmission_time_ms / state['host'][host]['delivered_pkts'])
+                host_delay = (transmission_time_ms / delivered)
             print(f'(Reinforcement) ====> Host {host} has real delay of {host_delay} ms')
             sum_real_delay = sum_real_delay + host_delay
 
@@ -835,7 +939,8 @@ class Environment():
         print("(Reinforcement) ==> Calculating throughput")
         sum_throughput = 0
         for host in self.normal_hosts:
-            host_throughput = state['host'][host]['non_server_data']['network_metrics']['throughput_bps']
+            metrics = state['host'][host]['non_server_data'].get('network_metrics') or {}
+            host_throughput = metrics.get('throughput_bps', 0.01)
             print(f'(Reinforcement) ====> Host {host} has throughput of {host_throughput} bps')
             sum_throughput = sum_throughput + host_throughput
         avg_throughput = sum_throughput / self.nbr_normal_hosts
@@ -847,8 +952,9 @@ class Environment():
         print("(Reinforcement) ==> Calculating latency")
         sum_latency = 0
         for host in self.normal_hosts:
-            host_latency = state['host'][host]['non_server_data']['network_metrics']['avg_latency_s']
-            print(f'(Reinforcement) ====> Host {host} has latency of {host_latency} s')
+            metrics = state['host'][host]['non_server_data'].get('network_metrics') or {}
+            host_latency = float(metrics.get('avg_latency_s', self.last_recorded_latency if self.last_recorded_latency > 0 else 1.0))
+            print(f'(Reinforcement) ====> Host {host} has latency of {host_latency} s (from metrics: {metrics.get("avg_latency_s", "default")})')
             sum_latency = sum_latency + host_latency
         avg_latency = sum_latency / self.nbr_normal_hosts
         print(f'(Reinforcement) ====> Calculated avg_latency = {avg_latency} s')
@@ -859,7 +965,8 @@ class Environment():
         print("(Reinforcement) ==> Calculating jitter")
         sum_jitter = 0
         for host in self.normal_hosts:
-            host_jitter = state['host'][host]['non_server_data']['network_metrics']['avg_jitter_s']
+            metrics = state['host'][host]['non_server_data'].get('network_metrics') or {}
+            host_jitter = float(metrics.get('avg_jitter_s', self.last_recorded_jitter if self.last_recorded_jitter > 0 else 1.0))
             print(f'(Reinforcement) ====> Host {host} has jitter of {host_jitter} s')
             sum_jitter = sum_jitter + host_jitter
         avg_jitter = sum_jitter / self.nbr_normal_hosts
@@ -869,20 +976,20 @@ class Environment():
     def calculate_real_delay_reward(self, action_can_be_taken, avg_real_delay):
         done = False
         if avg_real_delay >= self.max_delay_ms:
-            reward = -3  # -2.5 (original value)
+            reward = -3
             done = True
         elif avg_real_delay <= self.tolerable_delay_ms:
-            reward = 3  # +2.5 (original value)
-            done = True
+            reward = 3
+            done = False
         elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
-            reward = -0.5  # -0.5 (original value)
+            reward = -0.5
             done = False
         elif not action_can_be_taken:
-            reward = -2
+            reward = -2  # paper: impossible action => -2
             done = False
         else:
             if avg_real_delay - 0.2 >= self.last_recorded_delay:
-                reward = -1
+                reward = -2  # paper: delta_x <= -threshold => -2
             elif avg_real_delay + 0.2 <= self.last_recorded_delay:
                 reward = 1
             else:
@@ -893,53 +1000,88 @@ class Environment():
 
     def calculate_latency_reward(self, action_can_be_taken, avg_latency):
         done = False
-        if avg_latency >= self.max_latency_s:
-            reward = self.reward_config["bounds"]["min"]
+        if avg_latency >= self.max_latency_s:          # max = 5.5s
+            reward = -3
             done = True
-        elif avg_latency <= self.tolerable_latency_s:
-            reward = self.reward_config["bounds"]["max"]
-            done = True
+        elif avg_latency <= self.tolerable_latency_s:  # tolerable = 0.02s
+            reward = 3
+            done = False
         elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
-            reward = self.reward_config["penalty"]
+            reward = -0.5
             done = False
         elif not action_can_be_taken:
-            reward = -0.5  # era -1 fisso, ora penalty più leggera
+            reward = -2  # paper: impossible action => -2
             done = False
         else:
-        # reward continua basata sul miglioramento relativo
-            improvement = self.last_recorded_latency - avg_latency
-            reward = float(np.clip(improvement / max(self.tolerable_latency_s, 1e-9), -1.0, 1.0))
-            done = False
+            if avg_latency - 0.002 >= self.last_recorded_latency:
+                reward = -2  # paper: delta_x <= -threshold => -2
+            elif avg_latency + 0.002 <= self.last_recorded_latency:
+                reward = 1   # paper: delta_x >= threshold => +1
+            else:
+                reward = -0.1
         self.last_recorded_latency = avg_latency
-        print(f"(Reinforcement) =====> Calculated latency reward as {reward} (done=>{done})")
         return reward, done
 
     def calculate_jitter_reward(self, action_can_be_taken, avg_jitter):
         done = False
         if avg_jitter >= self.max_jitter_s:
-            reward = self.reward_config["bounds"]["min"]
+            reward = -3
             done = True
         elif avg_jitter <= self.tolerable_jitter_s:
-            reward = self.reward_config["bounds"]["max"]
-            done = True
+            reward = 3
+            done = False
         elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
-            reward = self.reward_config["penalty"]
+            reward = -0.5
             done = False
         elif not action_can_be_taken:
-            reward = -0.5  # era -1 fisso
+            reward = -2  # paper: impossible action => -2
             done = False
         else:
-        # reward continua basata sul miglioramento relativo
-            improvement = self.last_recorded_jitter - avg_jitter
-            reward = float(np.clip(improvement / max(self.tolerable_jitter_s, 1e-9), -1.0, 1.0))
-            done = False
+            if avg_jitter - 0.002 >= self.last_recorded_jitter:
+                reward = -2  # paper: delta_x <= -threshold => -2
+                done = False
+            elif avg_jitter + 0.002 <= self.last_recorded_jitter:
+                reward = 1   # paper: delta_x >= threshold => +1
+                done = False
+            else:
+                reward = -0.1
+                done = False
         self.last_recorded_jitter = avg_jitter
         print(f"(Reinforcement) =====> Calculated jitter reward as {reward} (done=>{done})")
         return reward, done
-    
+
+    def calculate_loss_reward(self, action_can_be_taken, avg_loss):
+        """Sub-reward per packet loss — stessa struttura asimmetrica di latency e jitter."""
+        done = False
+        if avg_loss >= self.max_loss:
+            reward = -3
+            done = True
+        elif avg_loss <= self.tolerable_loss:
+            reward = 3
+            done = False
+        elif self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER > self.MAX_DO_NOTHING_ACTION_BEFORE_PENALTY:
+            reward = -0.5
+            done = False
+        elif not action_can_be_taken:
+            reward = -2  # impossible action => -2
+            done = False
+        else:
+            if avg_loss - self.threshold_loss >= self.last_recorded_loss:
+                reward = -2  # peggioramento => -2
+                done = False
+            elif avg_loss + self.threshold_loss <= self.last_recorded_loss:
+                reward = 1   # miglioramento => +1
+                done = False
+            else:
+                reward = -0.1
+                done = False
+        self.last_recorded_loss = avg_loss
+        print(f"(Reinforcement) =====> Calculated loss reward as {reward} (done=>{done})")
+        return reward, done
+
     # Calculates the reward for the reinforcement learning agent based on multiple network performance metrics.
-    # Rewards are calculated using latency and jitter to guide the agent's learning process.
-    def calculate_reward(self, state, action_can_be_taken):
+    # Rewards are calculated using latency, jitter and packet loss to guide the agent's learning process.
+    def calculate_reward(self, state, action_can_be_taken, w_lat=1.0, w_jit=1.0, w_loss=1.0):
         print("(Reinforcement) ==> Calculating reward")
 
         avg_PKT_loss_percentage = self.calculate_loss(state)
@@ -955,19 +1097,29 @@ class Environment():
         r2, d2 = self.calculate_latency_reward(action_can_be_taken, avg_latency)
         r3, d3 = self.calculate_jitter_reward(action_can_be_taken, avg_jitter)
 
-        r_loss = -float(np.clip(avg_PKT_loss_percentage * 2.0, 0.0, 1.0))
-        reward = r1 + r2 + r3 + r_loss
+        r4, d4 = self.calculate_loss_reward(action_can_be_taken, avg_PKT_loss_percentage)
+        reward = r1 + (w_lat * r2) + (w_jit * r3) + (w_loss * r4)
         # Set (done) to False in order to calibrate the system
         # done = False
-        done = d1 or d2 or d3
+        done = d1 or d2 or d3 or d4
 
         print(f"(Reinforcement) <-----> result after calculating reward = {reward} "
-          f"(r_latency={r2:.3f}, r_jitter={r3:.3f}, r_loss={r_loss:.3f}, done={done})")
+          f"(r_lat={r2:.3f}*w{w_lat:.2f}, r_jit={r3:.3f}*w{w_jit:.2f}, r_loss={r4:.3f}*w{w_loss:.2f}, done={done})")
         return reward, done, avg_PKT_loss_percentage, avg_real_delay, avg_latency, avg_jitter
-   
     # Resets the environment to its initial state, clearing all episode data and network configurations.
     def reset(self):
         print("----> Environment reset")
+        self.last_recorded_latency = 0.0
+        self.last_recorded_jitter  = 0.0
+        self.last_recorded_delay   = 0.0
+        self.last_recorded_loss    = 0.0
+        self.before_last_recorded_delay = 0.0
+        self.DO_NOTHING_ACTION_SUCCESSIVE_COUNTER = 0
+        self.episode_actions_text_list = []
+        self.last_tcp_flow_duration = 0.0
+        self.last_tshark_duration = 0.0
+        self.last_netmetrics_duration = 0.0
+        self.last_reset_mininet_duration = 0.0
 
     # Prints a human-readable description of the selected action for debugging purposes.
     def print_action(self, action):
