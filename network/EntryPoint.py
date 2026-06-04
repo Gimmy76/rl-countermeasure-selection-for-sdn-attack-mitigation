@@ -1,4 +1,6 @@
+import os
 from mininet.log import setLogLevel
+import subprocess
 import Shared as shared
 import ApiManager as apiMgr
 import NetworkManager as netMgr
@@ -20,5 +22,14 @@ if __name__ == '__main__':
 
     config = vars(parser.parse_args())
     shared.init(config)
+    # subprocess.run("mn -c", shell=True)  # RIMOSSO: distrugge altri trial paralleli
+    _tid = os.environ.get("TRIAL_ID", "none")
+    print(f"[EntryPoint] Skipping global mn -c (parallel-safe mode), TRIAL_ID={_tid}")
+    print("Pre-cleaning Mininet...")
+    print("Pre-clean done.")
+
+    print("[EntryPoint] Starting Flask API...")
     apiMgr.run_flask(shared.GLOBALS)
+    print("[EntryPoint] Flask API started, now starting Mininet...")
+
     netMgr.run_mininet(shared.GLOBALS)
