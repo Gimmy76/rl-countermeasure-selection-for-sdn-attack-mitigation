@@ -1,6 +1,23 @@
+"""
+QoSentry Training Loop — Reinforcement Learning for DDoS Mitigation in SDN
+
+CRITICAL TIMING CONSTRAINTS (Fixed by Paper — DO NOT MODIFY):
+- TCP flow duration per step: 40 seconds (non-negotiable)
+- DDoS attack duration: 40 seconds (non-negotiable)
+- tshark capture post-flow: 15 seconds (non-negotiable)
+- Network reset between steps: 2-3 seconds
+→ MINIMUM per step: ~55 seconds (wall-clock time)
+→ 50 episodes × 100 steps = 5,000 steps → ~76+ hours per trial
+
+Optimization focus: Scapy processing, DDQN replay, logging (remaining 20-25% of time).
+See TIMING_CONSTRAINTS.md for detailed timing analysis.
+"""
+
 import random
 import numpy as np
-from matplotlib.pyplot import cm
+import tensorflow as tf
+tf.config.threading.set_inter_op_parallelism_threads(2)
+tf.config.threading.set_intra_op_parallelism_threads(2)
 import csv
 from decimal import Decimal
 from Configuration import Configuration
@@ -10,8 +27,6 @@ from CmdManager import CmdManager
 from DdqnAgent import DoubleDeepQNetwork
 import matplotlib.pyplot as plt
 import shutil
-import argparse
-import tensorflow as tf
 import os
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -20,12 +35,67 @@ import optuna
 import time
 from datetime import datetime
 import plotly.express as px
+from collections import defaultdict
+import json
 
-# Copies a CICFlowMeter output file to a new location.
-# This is used to store the network flow metrics collected during an experiment step
+
+# ---------------------------------------------------------------------------
+# TIMING INSTRUMENTATION
+# ---------------------------------------------------------------------------
+
+class TimingTracker:
+    """Tracks execution time of key components to identify bottlenecks."""
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.trial_start = None
+    
+    def start_trial(self):
+        self.trial_start = time.time()
+        self.timings.clear()
+    
+    def log(self, component_name, duration_seconds):
+        """Log timing for a component."""
+        self.timings[component_name].append(duration_seconds)
+        if duration_seconds > 5:  # Only print long operations
+            print(f"[TIMING] {component_name}: {duration_seconds:.2f}s")
+    
+    def get_summary(self):
+        """Generate timing summary for trial."""
+        summary = {}
+        total_time = 0
+        for component in sorted(self.timings.keys()):
+            times = self.timings[component]
+            avg = sum(times) / len(times)
+            total = sum(times)
+            total_time += total
+            summary[component] = {
+                "count": len(times),
+                "avg_s": round(avg, 2),
+                "total_s": round(total, 1),
+                "pct": round(100 * total / (total_time or 1), 1),
+            }
+        summary["TOTAL_TIME_S"] = round(total_time, 1)
+        summary["TOTAL_TIME_H"] = round(total_time / 3600, 2)
+        return summary
+    
+    def save_report(self, output_path):
+        """Save timing report to JSON."""
+        summary = self.get_summary()
+        with open(output_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n[TIMING] Report saved: {output_path}")
+        print(json.dumps(summary, indent=2))
+
+timing_tracker = TimingTracker()
+
+
+# ---------------------------------------------------------------------------
+# UTILITY FUNCTIONS
+# ---------------------------------------------------------------------------
+
 def copy_cic_step_file(config, path_to_save, episode, step):
     try:
-        cic_file_name = f"Episdode {episode} - Step {step} - CIC results.csv"
+        cic_file_name = f"Episode {episode} - Step {step} - CIC results.csv"
         destination = os.path.join(path_to_save, "cic", cic_file_name)
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         shutil.copyfile(config.cic_output_file_path, destination)
@@ -33,93 +103,59 @@ def copy_cic_step_file(config, path_to_save, episode, step):
         print(f"(Warning) Could not copy CIC file: {e}")
 
 
-
-
-# Randomly selects an attack type from a predefined list of attacks.
 def get_attack_type():
-    # available_attacks = ["ICMP", "TCP", "UDP", "SYN"] # TDOO: Uncomment if random attack type
-    available_attacks = ["ICMP"] # TODO: for testing purposes, currently just using ICMP attacks
-    attack_type_index = random.randint(0, len(available_attacks) - 1)
-    return available_attacks[attack_type_index]
+    return "ICMP"
+
 
 def get_basic_metrics_headers():
-    headers = ["tx_bytes",
-               "rx_bytes",
-               "bandwidth",
-               "tx_packets",
-               "rx_packets",
-               "tx_packets_len",
-               "rx_packets_len",
-               "delivered_pkts",
-               "loss_pct",
-               "is_connected",
-               "pkts_s",
-               "bytes_s"]
-    return headers
+    return ["tx_bytes", "rx_bytes", "bandwidth", "tx_packets", "rx_packets",
+            "tx_packets_len", "rx_packets_len", "delivered_pkts", "loss_pct",
+            "is_connected", "pkts_s", "bytes_s"]
+
 
 def get_network_metrics_headers():
-    headers = ["avg_latency_s",
-               "avg_packet_transmission_time_s",
-               "throughput_bps",
-               "avg_jitter_s"]
-    return headers
+    return ["avg_latency_s", "avg_packet_transmission_time_s",
+            "throughput_bps", "avg_jitter_s"]
 
-SWITCHES_BW_HEADERS = None
-
-def save_file_with_headers(filepath, data, headers, fmt='%.18e'):
-    with open(filepath, 'w') as result_file:
-        wr = csv.writer(result_file)
-        wr.writerow(headers)
-        np.savetxt(result_file, data, delimiter=',', fmt=fmt)
-
-
-# Checks the network state data for anomalies such as NaN, infinite values, or negative metrics.
-# If any issues are found, a warning file is generated to log the detected problems for further inspection.
-def generate_warning_file_if_necessary(config, file_name, new_state):
-    headers = get_basic_metrics_headers()
-    headers.remove("bandwidth")
-    warnings = ""
-    for host in new_state ['host'].keys():
-        for header in headers:
-            val = new_state['host'][host][header]
-            if np.insan(val):
-                warnings += f"\nINSAN: new_state['host'][{host}][{header}]={val}"
-            elif np.isinf(val):
-                warnings += f"\nISINF: new_state['host'][{host}][{header}]={val}"
-            elif val < 0:
-                 warnings += f"\nNEGATIVE: new_state['host'][{host}][{header}]={val}"
-    if warnings:
-        warning_file = f"{config.current_train_folder}/{file_name}"
-        with open(warning_file, 'w') as f:
-            f.write(warnings)
 
 def setup_directories(base_dir):
-    ##Creates the folder structure for a training run
-    for folder in ["data", "figs", "cic", "configs"]:
+    for folder in ["data", "figs", "cic", "configs", "models", "timing"]:
         os.makedirs(os.path.join(base_dir, folder), exist_ok=True)
 
 
-def save_episode_plots(current_run_dir, episode, ep_rews, ep_lats, ep_loss, ep_jits, episode_hosts_bw):
-    ##Generates and saves all PNG and HTML plots for a given episode
+def save_step_timing_row(timing_dir, row):
+    file_path = os.path.join(timing_dir, "step_timing.csv")
+    fieldnames = [
+        "episode", "step", "step_total_s", "tcp_flow_s", "tshark_s",
+        "netmetrics_s", "experience_replay_s", "logging_mlflow_s",
+        "reset_mininet_s", "episode_elapsed_s"
+    ]
+    write_header = not os.path.exists(file_path)
+    with open(file_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def save_episode_plots(current_run_dir, episode, ep_rews, ep_lats, ep_loss,
+                       ep_jits, episode_hosts_bw):
     def save_plot_png(data, title, color, filename):
-        plt.figure(figsize=(10,6))
+        plt.figure(figsize=(10, 6))
         plt.plot(data, color=color, label=title)
         plt.title(f"Episode {episode} - {title}")
         plt.xlabel("Steps")
         plt.ylabel("Value")
         plt.legend()
-        plt.savefig(os.path.join(current_run_dir, "figs", f"Episode_{episode}_{filename}.png"))
-
+        plt.savefig(os.path.join(current_run_dir, "figs",
+                                 f"Episode_{episode}_{filename}.png"))
         plt.close()
 
+    save_plot_png(ep_rews, "Reward",      "blue",   "Reward")
+    save_plot_png(ep_lats, "Latency",     "green",  "Latency")
+    save_plot_png(ep_loss, "Packet Loss", "orange", "Packet_Loss")
+    save_plot_png(ep_jits, "Jitter",      "purple", "Jitter")
 
-    save_plot_png(ep_rews,  "Reward",      "blue",   "Reward")
-    save_plot_png(ep_lats,  "Latency",     "green",  "Latency")
-    save_plot_png(ep_loss,  "Packet Loss", "orange", "Packet_Loss")
-    save_plot_png(ep_jits,  "Jitter",      "purple", "Jitter")
-
-
-    # Multi-line bandwidth plot
     plt.figure(figsize=(10, 6))
     for host, values in episode_hosts_bw.items():
         plt.plot(values, label=f"Host {host}")
@@ -129,77 +165,157 @@ def save_episode_plots(current_run_dir, episode, ep_rews, ep_lats, ep_loss, ep_j
     plt.legend(loc='upper right', fontsize='small')
     plt.savefig(os.path.join(current_run_dir, "figs",
                              f"Episode_{episode}_Hosts_BW.png"))
-    plt.close() 
+    plt.close()
+
+    try:
+        fig_lat = px.line(y=ep_lats,
+                          title=f"Interactive Latency Ep {episode}",
+                          labels={'y': 'Latency (s)', 'x': 'Steps'})
+        fig_lat.write_html(os.path.join(current_run_dir, "figs",
+                                        f"Episode_{episode}_latency_interactive.html"))
+    except Exception as e:
+        print(f"(Warning) Could not save interactive plot: {e}")
 
 
-     # Interactive Plotly HTML
-    fig_lat = px.line(y=ep_lats,
-                      title=f"Interactive Latency Ep {episode}",
-                      labels={'y': 'Latency (s)', 'x': 'Steps'})
-    fig_lat.write_html(os.path.join(current_run_dir, "figs",
-                                    f"Episode_{episode}_latency_interactive.html"))
+# ---------------------------------------------------------------------------
+# CORE EXPERIMENT FUNCTION
+# ---------------------------------------------------------------------------
 
+def save_extra_plots(current_run_dir, episode, ep_throughput, ep_ddqn_loss, ep_sw_bw_matrix, sw_headers):
+    """Plot aggiuntivi: throughput, DDQN loss, switch BW."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
 
+    # Throughput
+    if ep_throughput:
+        plt.figure(figsize=(10, 6))
+        plt.plot(ep_throughput, color='teal', label='Avg Throughput (bps)')
+        plt.title(f"Episode {episode} - Average Throughput")
+        plt.xlabel("Steps")
+        plt.ylabel("bps")
+        plt.legend()
+        plt.savefig(os.path.join(current_run_dir, "figs",
+                                 f"Episode_{episode}_Throughput.png"))
+        plt.close()
 
-## CORE EXPERIMENT FUNCTION
+    # DDQN loss function
+    if ep_ddqn_loss:
+        plt.figure(figsize=(10, 6))
+        plt.plot(ep_ddqn_loss, color='red', label='DDQN Loss')
+        plt.title(f"Episode {episode} - DDQN Loss Function")
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.savefig(os.path.join(current_run_dir, "figs",
+                                 f"Episode_{episode}_DDQN_Loss.png"))
+        plt.close()
 
+    # Switch BW heatmap
+    if ep_sw_bw_matrix and sw_headers:
+        try:
+            matrix = np.array(ep_sw_bw_matrix, dtype=float)
+        except (ValueError, TypeError):
+            matrix = np.array([[float(v) if v != '' else 0.0 for v in row] for row in ep_sw_bw_matrix], dtype=float)
+        plt.figure(figsize=(max(10, len(sw_headers)), 6))
+        plt.imshow(matrix.T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+        plt.colorbar(label='Bandwidth')
+        plt.yticks(range(len(sw_headers)), sw_headers, fontsize=7)
+        plt.xlabel("Steps")
+        plt.title(f"Episode {episode} - Switch Bandwidth Heatmap")
+        plt.tight_layout()
+        plt.savefig(os.path.join(current_run_dir, "figs",
+                                 f"Episode_{episode}_SwitchBW_Heatmap.png"))
+        plt.close()
 
-def run_experiment(cfg:DictConfig, trial=None):
+    # Attacker vs Benign loss (se loggato)
+    print(f"[PLOTS] Extra plots saved for episode {episode}")
 
-    with mlflow.start_run(nested=True):
-        ## Parameter initilization
+def run_experiment(cfg: DictConfig, trial=None):
+    run_name = f"trial_{trial.number}" if trial is not None else "standard_train"
+    nested_run = trial is not None
+
+    with mlflow.start_run(run_name=run_name, nested=nested_run):
+        timing_tracker.start_trial()
+        if trial is not None:
+            mlflow.set_tag("trial_number", trial.number)
+
+        # ------------------------------------------------------------------
+        # 1. PARAMETER INITIALIZATION
+        # ------------------------------------------------------------------
         if trial:
-            w_lat = trial.suggest_float("w_latency", 0.1, 5.0)
-            w_jit = trial.suggest_float("w_jitter", 0.1, 5.0)
-            lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-
-            gamma = trial.suggest_float("gamma", 0.7, 0.99)
-            epsilon_decay = trial.suggest_float("epsilon_decay", 0.990, 0.9999)
+            w_lat           = trial.suggest_float("w_latency",       0.5,   2.0)
+            w_jit           = trial.suggest_float("w_jitter",        0.5,   2.0)
+            w_loss          = trial.suggest_float("w_loss",           0.5,   2.0)
+            tolerable_loss  = trial.suggest_float("tolerable_loss",   0.10, 0.45)
+            threshold_loss  = trial.suggest_float("threshold_loss",   0.01,  0.10)
+            lr              = trial.suggest_float("lr",               1e-4,  5e-2, log=True)
+            gamma         = trial.suggest_float("gamma", 0.70, 0.99)
+            epsilon_decay = trial.suggest_float("epsilon_decay", 0.9950, 0.9999)
+            batch_size    = trial.suggest_categorical("batch_size", [128, 256, 512])
         else:
-            w_lat = cfg.reward_weights.w_latency
-            w_jit = cfg.reward_weights.w_jitter
-            lr = cfg.hyperparameters.learning_rate
-            gamma = cfg.hyperparameters.get("gamma", 0.5)
+            w_lat          = cfg.reward.w_latency
+            w_jit          = cfg.reward.w_jitter
+            w_loss         = cfg.reward.w_loss
+            tolerable_loss = cfg.reward.tolerable_loss
+            threshold_loss = cfg.reward.threshold_loss
+            lr            = cfg.training.learning_rate
+            gamma         = cfg.training.discount_factor
             epsilon_decay = cfg.epsilon_decay
-        
+            batch_size    = 128
+
         mlflow.log_params({
-            "w_lat": w_lat, "w_jit": w_jit, "lr":lr, "gamma": gamma, "epsilon_decay": epsilon_decay,
+            "w_lat": w_lat, "w_jit": w_jit, "w_loss": w_loss,
+            "tolerable_loss": tolerable_loss, "threshold_loss": threshold_loss,
+            "lr": lr, "gamma": gamma, "epsilon_decay": epsilon_decay, "batch_size": batch_size,
         })
         mlflow.set_tag("topology", cfg.hosts_topo)
-        mlflow.set_tag("mlflow.note.content", f"QoS run on {cfg.hosts.topo} | lr={lr:.5f}")
+        mlflow.set_tag("mlflow.note.content",
+                       f"QoS run on {cfg.hosts_topo} | lr={lr:.5f}")
 
-        ## Folder setup
-
+        # ------------------------------------------------------------------
+        # 2. FOLDER SETUP
+        # ------------------------------------------------------------------
         timestamp       = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         current_run_dir = f"results/train_{timestamp}"
         setup_directories(current_run_dir)
+        timing_dir = os.path.join(current_run_dir, "timing")
+        os.makedirs(timing_dir, exist_ok=True)
 
         config_path = os.path.join(current_run_dir, "configs", "config_used.yaml")
         with open(config_path, "w") as f:
             f.write(OmegaConf.to_yaml(cfg))
         mlflow.log_artifact(config_path)
 
-
-
-        ### ENVIRONMENT & AGENT INIT
-
+        # ------------------------------------------------------------------
+        # 3. ENVIRONMENT & AGENT INIT
+        # ------------------------------------------------------------------
         config = Configuration(
             cfg.hosts_topo, cfg.episodes, cfg.steps,
-            epsilon_decay,               # uses tuned value when in tune mode
+            epsilon_decay,
             cfg.nbr_controlled_switches
         )
         env         = Environment(config)
+        # Normalize weights so w_lat + w_jit = 2 (come nel paper: 1.0 + 1.0)
+        # pesi diretti come paper
+        env.w_lat          = w_lat
+        env.w_jit          = w_jit
+        env.w_loss         = w_loss
+        env.tolerable_loss = tolerable_loss
+        env.threshold_loss = threshold_loss
         cmd         = CmdManager(config)
         http_client = HttpClient(config)
 
-        # FIX 1 — learning_rate and gamma are passed to the DDQN constructor
         ddqn_agent = DoubleDeepQNetwork(
             config, env, http_client,
             is_controlled=False,
             is_prefilled_actions=False,
             gamma=gamma,
-            learning_rate=lr          # ← was missing in original code
+            learning_rate=lr,
+            batch_size=batch_size
         )
+
+
 
         total_rewards_per_episode = []
 
@@ -207,13 +323,14 @@ def run_experiment(cfg:DictConfig, trial=None):
             for episode in range(1, config.episodes + 1):
 
                 tot_episode_reward = 0
-                current_state      = env.reset()
+                env.reset()
                 env.update_hosts()
 
                 episode_hosts_bw = {h: [] for h in env.hosts}
                 ep_rews, ep_lats, ep_jits, ep_loss = [], [], [], []
+                ep_throughput, ep_ddqn_loss = [], []
                 ep_sw_bw_matrix = []
-                sw_headers      = None
+                sw_headers = None
 
                 env.perform_setup(http_client, cfg.get('attackers', []))
                 ddqn_agent.set_actions(env.ACTIONS)
@@ -223,28 +340,53 @@ def run_experiment(cfg:DictConfig, trial=None):
                     config.nbr_controlled_switches
                 )
 
-                print(f"(RL) Episode {episode} - Starting simulation...")
-                time.sleep(20)
+                print(f"(RL) Episode {episode}/{config.episodes} - Network started, waiting stabilization...")
 
+                reset_start = time.time()
                 env.update_hosts_ips(http_client)
                 env.update_interfaces(http_client.get_switches_interfaces())
+                env.last_reset_mininet_duration = time.time() - reset_start
                 tshark_ids = env.get_tshark_interfaces_ids(cmd)
 
-                sender_receiver_relation  = {h: random.choice(env.servers)        for h in env.normal_hosts}
-                attacker_victim_relation  = {a: random.choice(env.victim_servers)  for a in env.attacker_hosts}
-                attack_types              = {a: get_attack_type()                  for a in env.attacker_hosts}
+                sender_receiver_relation = {h: random.choice(env.servers)       for h in env.normal_hosts}
+                attacker_victim_relation = {a: random.choice(env.victim_servers) for a in env.attacker_hosts}
+                attack_types             = {a: get_attack_type()                 for a in env.attacker_hosts}
 
+                # Stato iniziale (usato come baseline per il calcolo dei delta di reward)
                 current_state = env.get_state(
                     config, cmd, http_client, tshark_ids,
                     sender_receiver_relation, attacker_victim_relation, attack_types
                 )
 
+                # FIX CRITICO: inizializza i baseline dal primo stato reale.
+                # Senza questo, al primo step di ogni episodio il delta è sempre
+                # negativo (latency reale > 0 vs baseline 0.0) → reward sempre negativa
+                # → episode_total_reward discende ad ogni episodio.
+                env.last_recorded_latency = env.calculate_latency(current_state)
+                env.last_recorded_jitter  = env.calculate_jitter(current_state)
+                env.last_recorded_delay   = env.calculate_delay(current_state)
+
+                print(f"(RL) Episode {episode} - Baseline: "
+                      f"lat={env.last_recorded_latency:.4f}s "
+                      f"jit={env.last_recorded_jitter:.4f}s "
+                      f"delay={env.last_recorded_delay:.1f}ms")
+
+                episode_start = time.time()
                 # --------------------------------------------------------------
-                # STEP LOOP
+                # STEP LOOP — TIMING BREAKDOWN (per paper constraints)
+                # ~40s: TCP flow execution (40s flow + 15s tshark capture = 55s min)
+                # ~2-5s: Scapy pcap processing (NetMetricsCalculator)
+                # ~2-5s: DDQN replay + prediction
+                # ~1-2s: Logging + HTTP calls
+                # Total: ~55-70s per step (non-reducible first 55s from paper)
+                # See TIMING_CONSTRAINTS.md for details
                 # --------------------------------------------------------------
                 for step in range(1, config.steps + 1):
+                    step_start = time.time()
 
-                    state_vec          = env.transform_state_dict_to_normalized_vector(current_state)
+                    print(f"(RL) Ep{episode} Step{step}/{config.steps}")
+
+                    state_vec            = env.transform_state_dict_to_normalized_vector(current_state)
                     action, is_predicted = ddqn_agent.action(step, state_vec)
 
                     new_state, base_reward, done, loss_val, delay, latency, jitter = \
@@ -253,33 +395,58 @@ def run_experiment(cfg:DictConfig, trial=None):
                             sender_receiver_relation, attacker_victim_relation,
                             attack_types, action, is_predicted
                         )
+                    network_simulation_duration = time.time() - step_start
+                    timing_tracker.log("Network_Simulation_TCPFlowTshark", network_simulation_duration)
 
-                    # FIX 4: log raw components so reward scale issues are visible
-                    reward_val        = base_reward - (w_lat * latency) - (w_jit * jitter)
+                    if done:
+                        print(f"[DONE] Ep{episode} Step{step} "
+                              f"lat={latency:.4f} jit={jitter:.4f} "
+                              f"delay={delay:.1f}ms reward={base_reward:.4f}")
+
+                    reward_val = float(np.clip(base_reward, -12.0, 18.0))  # range: w*[-2,-2,-2] a w*[+3,+3,+3] con w_max=2
                     tot_episode_reward += reward_val
 
                     global_step = (episode - 1) * config.steps + step
 
-                    mlflow.log_metric("latency_step",     latency,          step=global_step)
-                    mlflow.log_metric("jitter_step",      jitter,           step=global_step)
-                    mlflow.log_metric("packet_loss_pct",  loss_val * 100,   step=global_step)
-                    mlflow.log_metric("base_reward_step", base_reward,      step=global_step)
-                    mlflow.log_metric("reward_step",      reward_val,       step=global_step)
-                    # FIX 4: log penalty terms individually so scaling problems
-                    # are immediately visible in the MLflow chart
-                    mlflow.log_metric("penalty_latency",  w_lat * latency,  step=global_step)
-                    mlflow.log_metric("penalty_jitter",   w_jit * jitter,   step=global_step)
+                    # Logging to MLflow
+                    logging_start = time.time()
+                    mlflow.log_metric("latency_step",     latency,        step=global_step)
+                    mlflow.log_metric("jitter_step",      jitter,         step=global_step)
+                    mlflow.log_metric("delay_step",       delay,          step=global_step)
+                    mlflow.log_metric("packet_loss_pct",  loss_val * 100, step=global_step)
+                    mlflow.log_metric("attacker_loss_pct", new_state["host"].get(env.attacker_hosts[0], {}).get("loss_pct", 0) * 100, step=global_step)
+                    mlflow.log_metric("benign_loss_pct", float(np.mean([new_state["host"].get(h, {}).get("loss_pct", 0) for h in env.normal_hosts])) * 100, step=global_step)
+                    mlflow.log_metric("base_reward_step", base_reward,    step=global_step)
+                    mlflow.log_metric("reward_step",      reward_val,     step=global_step)
+                    mlflow.log_metric("epsilon",          ddqn_agent.epsilon, step=global_step)
+                    mlflow.log_metric("throughput_bps",    env.calculate_throughput(new_state), step=global_step)
+                    # Attacker metrics (latency, jitter, throughput)
+                    _att = env.attacker_hosts[0]
+                    _att_metrics = new_state["host"].get(_att, {}).get("non_server_data", {}).get("network_metrics") or {}
+                    mlflow.log_metric("attacker_latency_step",   float(_att_metrics.get("avg_latency_s", 0)),   step=global_step)
+                    mlflow.log_metric("attacker_jitter_step",    float(_att_metrics.get("avg_jitter_s", 0)),    step=global_step)
+                    mlflow.log_metric("attacker_throughput_bps", float(new_state["host"].get(_att, {}).get("non_server_data", {}).get("network_metrics", {}).get("throughput_bps", 0)), step=global_step)
+                    logging_duration = time.time() - logging_start
+                    timing_tracker.log("Logging_MLflow", logging_duration)
+
+                    replay_duration = 0.0
+                    if len(ddqn_agent.memory) > ddqn_agent.batch_size:
+                        replay_start = time.time()
+                        ddqn_agent.experience_replay(ddqn_agent.batch_size)
+                        replay_duration = time.time() - replay_start
+                        timing_tracker.log("DDQN_ExperienceReplay", replay_duration)
 
                     ep_rews.append(reward_val)
                     ep_lats.append(latency)
                     ep_jits.append(jitter)
                     ep_loss.append(loss_val)
+                    ep_throughput.append(env.calculate_throughput(new_state))
+                    ep_ddqn_loss.append(ddqn_agent.episode_loss[-1] if ddqn_agent.episode_loss else 0.0)
 
                     for h in env.hosts:
                         val_bw = new_state['host'].get(h, {}).get('bandwidth', 0)
-                        episode_hosts_bw[h].append(val_bw)
+                        episode_hosts_bw[h].append(float(val_bw))
 
-                    # Switch bandwidth matrix
                     sw_row, current_sw_headers = [], []
                     for category in ['routing', 'controlled']:
                         for src in new_state[category]:
@@ -293,23 +460,45 @@ def run_experiment(cfg:DictConfig, trial=None):
 
                     copy_cic_step_file(config, current_run_dir, episode, step)
 
-                    ddqn_agent.store(
-                        state_vec, action, reward_val,
-                        env.transform_state_dict_to_normalized_vector(new_state),
-                        done
-                    )
+                    next_state_vec = env.transform_state_dict_to_normalized_vector(new_state)
+                    ddqn_agent.store(state_vec, action, reward_val, next_state_vec, done)
 
-                    if len(ddqn_agent.memory) > ddqn_agent.batch_size:
-                        ddqn_agent.experience_replay(ddqn_agent.batch_size)
+                    # FIX: experience_replay chiamato UNA SOLA VOLTA per step
+                    # FIX: epsilon decay indipendente dalla replay
+                    if ddqn_agent.decay_epsilon() < 1.0:
+                        print(f"<------>  Epsilon: {ddqn_agent.epsilon:.5f}")
+
+                    step_total = time.time() - step_start
+                    step_record = {
+                        "episode": episode,
+                        "step": step,
+                        "step_total_s": round(step_total, 3),
+                        "tcp_flow_s": round(env.last_tcp_flow_duration, 3),
+                        "tshark_s": round(env.last_tshark_duration, 3),
+                        "netmetrics_s": round(getattr(cmd, 'last_netmetrics_duration', 0.0), 3),
+                        "experience_replay_s": round(replay_duration, 3),
+                        "logging_mlflow_s": round(logging_duration, 3),
+                        "reset_mininet_s": round(getattr(env, 'last_reset_mininet_duration', 0.0), 3),
+                        "episode_elapsed_s": round(time.time() - episode_start, 3),
+                    }
+                    save_step_timing_row(timing_dir, step_record)
+
+                    # Aggiornamento periodico target network o su done
+                    if step % ddqn_agent.update_target_each == 0 or done:
+                        ddqn_agent.update_target_from_model()
 
                     current_state = new_state
+
                     if done:
+                        print(f"(RL) Episode {episode} ended early at step {step}")
                         break
 
                 # --------------------------------------------------------------
                 # END OF EPISODE
                 # --------------------------------------------------------------
-                print(f"(RL) Episode {episode} finished. Saving results...")
+                steps_run = len(ep_rews)
+                print(f"(RL) Episode {episode} finished ({steps_run} steps). "
+                      f"Total reward: {tot_episode_reward:.4f}")
 
                 sw_bw_path = os.path.join(current_run_dir, "data",
                                           f"Episode_{episode}_switches_bw.csv")
@@ -319,32 +508,64 @@ def run_experiment(cfg:DictConfig, trial=None):
                                header=",".join(sw_headers),
                                comments='')
 
+                save_extra_plots(current_run_dir, episode, ep_throughput, ep_ddqn_loss, ep_sw_bw_matrix, sw_headers)
                 save_episode_plots(current_run_dir, episode,
                                    ep_rews, ep_lats, ep_loss,
                                    ep_jits, episode_hosts_bw)
 
                 total_rewards_per_episode.append(tot_episode_reward)
-                mlflow.log_metric("episode_total_reward",
-                                  tot_episode_reward, step=episode)
+                mlflow.log_metric("episode_total_reward", tot_episode_reward, step=episode)
 
-                cmd.stop_network()
+                # Early stopping: ferma se reward media cala per 5 episodi consecutivi
+                EARLY_STOP_PATIENCE = 999  # early stopping disabilitato
+                EARLY_STOP_MIN_DELTA = 0.99  # soglia impossibile da raggiungere
+                if len(total_rewards_per_episode) >= EARLY_STOP_PATIENCE * 2:
+                    avg_recent   = float(np.mean(total_rewards_per_episode[-EARLY_STOP_PATIENCE:]))
+                    avg_previous = float(np.mean(total_rewards_per_episode[-EARLY_STOP_PATIENCE*2:-EARLY_STOP_PATIENCE]))
+                    degradation = (avg_previous - avg_recent) / (abs(avg_previous) + 1e-8)
+                    if avg_recent < avg_previous and degradation > EARLY_STOP_MIN_DELTA:
+                        print(f"[EARLY STOP] avg_reward ultimi {EARLY_STOP_PATIENCE} ep ({avg_recent:.4f}) "
+                              f"< precedenti {EARLY_STOP_PATIENCE} ep ({avg_previous:.4f}) "
+                              f"degradazione={degradation:.2%}. Stop.")
+                        mlflow.set_tag("status", "EARLY_STOPPED")
+                        break
+                mlflow.log_metric("episode_steps_run",    steps_run,          step=episode)
 
-            # FIX 5 — log_artifacts called ONCE after all episodes, not inside the loop
+                # Checkpoint modello ogni 5 episodi
+                if episode % 5 == 0:
+                    model_path = os.path.join(current_run_dir, "models",
+                                              f"model_ep{episode}.keras")
+                    ddqn_agent.save_model(model_path)
+                    print(f"[CHECKPOINT] Model saved at episode {episode}: {model_path}")
+
+                try:
+                    cmd.stop_network()
+                except Exception as _stop_err:
+                    print(f"(RL) WARNING: stop_network episode {episode} failed: {_stop_err}")
+
+            # Save timing report
+            timing_report_path = os.path.join(current_run_dir, "timing_report.json")
+            timing_tracker.save_report(timing_report_path)
+            # Ensure the step-level timing CSV is saved in the timing folder
+            print(f"[TIMING] Step-level timing file available in: {os.path.join(timing_dir, 'step_timing.csv')}")
+            
+            # FIX: log_artifacts UNA SOLA VOLTA dopo tutti gli episodi
             mlflow.log_artifacts(current_run_dir)
 
         except Exception as e:
             mlflow.set_tag("status", "FAILED")
             mlflow.log_param("error_message", str(e))
-            print(f"CRITICAL ERROR: {e}")
+            print(f"CRITICAL ERROR in episode loop: {e}")
             try:
                 cmd.stop_network()
             except Exception:
                 pass
-            raise   # FIX 6 — bare raise preserves the original traceback
+            raise
 
         avg_reward = float(np.mean(total_rewards_per_episode))
         mlflow.log_metric("final_average_reward", avg_reward)
         mlflow.set_tag("status", "OK")
+        print(f"(RL) Experiment finished. avg_reward={avg_reward:.4f}")
         return avg_reward
 
 
@@ -354,44 +575,110 @@ def run_experiment(cfg:DictConfig, trial=None):
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-
-    # FIX 2 — called exactly once, here at startup
-    mlflow.enable_system_metrics_logging()
-    mlflow.set_experiment("QoSentry_Optimization")
+    import os as _os
+    
+    # Ogni worker ha il suo esperimento MLflow separato
+    trial_id = _os.environ.get("TRIAL_ID", "_default").replace("_", "")
+    experiment_name = "QoSentry_Optimization"
+    
+    # MLflow server centralizzato: tutti i trial scrivono allo stesso server
+    mlflow.set_tracking_uri("http://127.0.0.1:5050")
+    mlflow.set_experiment(experiment_name)
+    
+    # Cleanup MLflow rimosso: ucciderebbe run di altri trial paralleli
 
     if cfg.mode == "tune":
         print("\n[INFO] Starting Optuna autotuning...")
+        _storage_path = _os.environ.get(
+            'OPTUNA_STORAGE',
+            f"sqlite:///{_os.getcwd()}/optuna_parallel.db"
+        )
+        _study_name = _os.environ.get('OPTUNA_STUDY_NAME', 'qosentry_parallel')
+        print(f"[OPTUNA] storage={_storage_path} study={_study_name}")
+        
+        # Storage SQLite con timeout esteso per gestire scritture concorrenti
+        _storage = optuna.storages.RDBStorage(
+            url=_storage_path,
+            engine_kwargs={
+                "connect_args": {"timeout": 60},
+                "pool_pre_ping": True,
+                "pool_size": 1,
+            },
+            heartbeat_interval=60,
+            failed_trial_callback=optuna.storages.RetryFailedTrialCallback(max_retry=3),
+        )
+        study = optuna.create_study(
+            study_name=_study_name,
+            storage=_storage,
+            direction="maximize",
+            load_if_exists=True,
+            sampler=optuna.samplers.TPESampler(seed=42)
+        )
+        study.optimize(
+            lambda trial: run_experiment(cfg, trial),
+            n_trials=int(cfg.tune_trials),
+        )
 
-        # FIX 3 — parent run opened HERE so that nested=True inside
-        #          run_experiment actually creates a proper parent-child hierarchy
-        with mlflow.start_run(run_name="optuna_study"):
-            mlflow.set_tag("mode", "tune")
-            mlflow.log_param("n_trials", cfg.tune_trials)
-
-            study = optuna.create_study(direction="maximize")
-            study.optimize(
-                lambda trial: run_experiment(cfg, trial),
-                n_trials=cfg.tune_trials
-            )
-
+        try:
             best = study.best_trial
-            print(f"\n[RESULT] Best trial #{best.number}  avg_reward={best.value:.4f}")
-            for k, v in best.params.items():
-                print(f"  {k}: {v}")
-                mlflow.log_param(f"best_{k}", v)
-            mlflow.log_metric("best_avg_reward", best.value)
+        except ValueError as exc:
+            print(f"[WARNING] No completed trials: {exc}")
+            return
 
-        # Save best params as YAML for subsequent training runs
+        print(f"\n[RESULT] Best trial #{best.number} avg_reward={best.value:.4f}")
+        for k, v in best.params.items():
+            print(f"  {k}: {v}")
+
         with open("best_params.yaml", "w") as f:
             OmegaConf.save(config=OmegaConf.create(study.best_params), f=f)
         print("[INFO] Best params saved to best_params.yaml")
+        # --- Ranking finale per metriche di rete ---
+        completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+        if completed:
+            print(f"\n[RANKING] Trials ordinati per metriche di rete finali:")
+            client = mlflow.tracking.MlflowClient()
+            trial_metrics = []
+            for t in completed:
+                run_name = f"trial_{t.number}"
+                runs = client.search_runs(
+                    experiment_ids=["1"],
+                    filter_string=f"tags.mlflow.runName = \'{run_name}\'",
+                    order_by=["attributes.start_time DESC"],
+                    max_results=1
+                )
+                if runs:
+                    r = runs[0]
+                    trial_metrics.append({
+                        "trial":       t.number,
+                        "avg_reward":  t.value,
+                        "latency":     r.data.metrics.get("latency_step",    float("inf")),
+                        "jitter":      r.data.metrics.get("jitter_step",     float("inf")),
+                        "packet_loss": r.data.metrics.get("packet_loss_pct", float("inf")),
+                        "throughput":  r.data.metrics.get("throughput_bps",  0.0),
+                    })
+            if trial_metrics:
+                hdr = f"  {'Trial':<8} {'AvgReward':<12} {'Latency(s)':<14} {'Jitter(s)':<12} {'PktLoss(%)':<12} {'Throughput(bps)'}"
+                sep = f"  {'-'*75}"
+                def row(m):
+                    return (f"  #{m['trial']:<7} {m['avg_reward']:<12.4f} "
+                            f"{m['latency']:<14.6f} {m['jitter']:<12.6f} "
+                            f"{m['packet_loss']:<12.2f} {m['throughput']:.1f}")
+                for label, key, rev in [
+                    ("avg_reward DESC", "avg_reward", True),
+                    ("latency ASC",     "latency",    False),
+                    ("jitter ASC",      "jitter",     False),
+                    ("packet_loss ASC", "packet_loss",False),
+                    ("throughput DESC", "throughput", True),
+                ]:
+                    print(f"\n  [By {label}]")
+                    print(hdr)
+                    print(sep)
+                    for m in sorted(trial_metrics, key=lambda x: x[key], reverse=rev):
+                        print(row(m))
 
     else:
         print("\n[INFO] Starting standard training...")
-        # Single run — no nesting needed
-        with mlflow.start_run(run_name="standard_train"):
-            mlflow.set_tag("mode", "train")
-            run_experiment(cfg)
+        run_experiment(cfg)
 
     print("\n[FINISH] Run completed.")
 
@@ -399,457 +686,3 @@ def main(cfg: DictConfig):
 if __name__ == '__main__':
     main()
 
-# # The main block initializes the reinforcement learning environment and manages the experiment workflow.
-# # Key steps include:
-# # - Parsing command-line arguments for experiment configurations.
-# # - Initializing the network environment, RL agent, and other components.
-# # - Running multiple training episodes where the RL agent interacts with the environment.
-# # - Logging results and visualizing metrics such as packet loss, delay, and bandwidth usage
-# if __name__ == '__main__':
-
-#     # Parses command-line arguments to allow the user to customize the experiment setup.
-#     # Configurable parameters include the number of episodes, steps, and the epsilon decay rate.
-#     # Validation checks ensure the parameters are within acceptable ranges.
-#     parser = argparse.ArgumentParser(description="Main",
-#                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-#     parser.add_argument("-a", "--attackers", help="Attacker hosts names. E.g: [h1]", required=False)
-#     parser.add_argument("-e", "--episodes", help="Number of episodes. E.g: 50", required=False)
-#     parser.add_argument("-s", "--steps", help="Number of steps. E.g: 100", required=False)
-#     parser.add_argument("-ed", "--epsilon-decay", help="Epsilon decay. E.g: 0.999", required=False)
-#     parser.add_argument("-ncs", "--nbr-controlled-switches", help="The number of controlled switches in the network", required=False)
-#     parser.add_argument("-c", "--controlled", action="store_true",
-#                         help="Whether to control action taking")
-#     parser.add_argument("-pfa", "--prefilled-actions", action="store_true",
-#                         help="Whether to use prefilled actions, from file 'prefilled-actions.txt'")
-#     parser.add_argument("-htf", "--hosts-topo-file",
-#                         help="When given, the provided JSON file in the 'input-data' folder will be used. E.g: hosts-topology-6hosts",
-#                         required=False, default="hosts-toplogy-6hosts")
-#     # Initializes the simulation environment and its components.
-#     # This involves setting up the network topology, controlled switches, and hosts.
-#     config = vars(parser.parse_args())
-#     is_controlled = config['controlled']
-#     is_prefilled_actions = config['prefilled_actions']
-#     if is_controlled and is_prefilled_actions:
-#         raise Exception("Please use either '--controlled' flag or '--prefilled-actions' flag, but not both!")
-#     pre_set_attackers = []
-#     if not (config['attackers'] is None or config['attackers'] == '' or config['attackers'] == '[]'):
-#         pre_set_attackers = config['attackers'].lstrip("[").rstrip("]").split(',')
-#     if is_controlled:
-#         print('(Reinforcement) ================> Main Started with "controlled actions"')
-#     elif is_prefilled_actions:
-#         print('(Reinforcement) ================> Main Started with "prefilled actions"')
-#     else:
-#         print('(Reinforcement) ================> Main Started')
-#     hosts_topo_file_name = 'hosts-toplogy-6hosts.json'
-#     if not ('hosts_topo_file' not in config or config['hosts_topo_file'] is None or config[
-#         'hosts_topo_file'] == ''):
-#         hosts_topo_file_name = config['hosts_topo_file']
-#         if not hosts_topo_file_name.lower().endswith(".json"):
-#             hosts_topo_file_name += ".json"
-#     episodes = 50
-#     if not ('episodes' not in config or config['episodes'] is None or config['episodes'] == ''):
-#         episodes = int(config['episodes'])
-#         print(f'(Reinforcement) ==================> Episodes: {episodes}')
-#     steps = 100
-#     if not ('steps' not in config or config['steps'] is None or config['steps'] == ''):
-#         steps = int(config['steps'])
-#         print(f'(Reinforcement) ==================> Steps: {steps}')
-#     epsilon_decay = 0.999
-#     if not ('epsilon_decay' not in config or config['epsilon_decay'] is None or config[
-#         'epsilon_decay'] == ''):
-#         epsilon_decay = float(config['epsilon_decay'])
-#         if epsilon_decay >= 1 or epsilon_decay <= 0.1:
-#             raise Exception("Epsilon decay must be in the range ]0.1, 1[!")
-#         print(f'(Reinforcement) ==================> Epsilon decay: {epsilon_decay}')
-#     nbr_controlled_switches = 4
-#     if not ('nbr_controlled_switches' not in config or config['nbr_controlled_switches'] is None or config['nbr_controlled_switches'] == ''):
-#         nbr_controlled_switches = int(config['nbr_controlled_switches'])
-#         if nbr_controlled_switches < 4:
-#             raise Exception(f"Number of controlled switches set to a ({nbr_controlled_switches}) which is lower than 4. Min value is 4!")
-#         if nbr_controlled_switches > 99:
-#             raise Exception(f"Number of controlled switches set to a ({nbr_controlled_switches}) which is more than 99. max value is 99!")
-#         print(f'(Reinforcement) ==================> Number of controlled switches: {nbr_controlled_switches}')
-
-#     config = Configuration(hosts_topo_file_name, episodes, steps, epsilon_decay, nbr_controlled_switches)
-#     env = Environment(config)
-#     cmd = CmdManager(config)
-#     http_client = HttpClient(config)
-#     tot_rewards = 0
-#     total_rewards_per_episode = []
-#     epsilons = []
-#     ddqn_agent = DoubleDeepQNetwork(config, env, http_client, is_controlled, is_prefilled_actions)
-
-#     global_vars_to_print = {
-#         "max_attacker": {},
-#         "max_host": {},
-#         "max_server": {},
-#     }
-#     for header in get_basic_metrics_headers():
-#         global_vars_to_print["max_attacker"][header] = 0
-#         global_vars_to_print["max_host"][header] = 0
-#         global_vars_to_print["max_server"][header] = 0
-
-#     for header in get_network_metrics_headers():
-#         global_vars_to_print["max_host"][header] = 0
-
-#     # Iterates through the specified number of episodes for training the reinforcement learning agent.
-#     # Each episode involves multiple interaction steps where the agent takes actions and receives feedback.
-#     # Traffic and performance metrics are collected and saved at the end of each episode.
-#     for episode in range(1, env.episodes + 1):
-#         tot_rewards = 0
-#         episode_index = episode - 1
-#         current_state = env.reset()
-
-#         episode_rewards = []
-#         ddqn_agent.episode_loss = []
-#         ddqn_agent.episode_loss = []
-#         episode_avg_packet_loss = []
-#         episode_avg_real_delays = []
-#         episode_avg_latencys = []
-#         episode_avg_jitters = []
-
-#         print(f'(Reinforcement) ==================> Episode {episode} Started')
-
-#         env.update_hosts()
-
-#         env.perform_setup(http_client, pre_set_attackers)
-
-#         ddqn_agent.set_actions(env.ACTIONS)
-
-#         cmd.start_network_in_background(env.servers, env.attacker_hosts, config.hosts_topo_file_name, nbr_controlled_switches)
-
-#         env.update_hosts_ips(http_client)
-
-#         env.update_interfaces(http_client.get_switches_interfaces())
-
-#         tshark_interfaces_ids = env.get_tshark_interfaces_ids(cmd)
-
-#         sender_receiver_relation = {}
-#         for host in env.normal_hosts:
-#             server_index = random.randint(0, len(env.servers) - 1)
-#             server = env.servers[server_index]
-#             sender_receiver_relation[host] = server
-
-#         attacker_victim_relation = {}
-#         attack_types = {}
-#         for attacker in env.attacker_hosts:
-#             victim_server_index = random.randint(0, len(env.victim_servers) - 1)
-#             victim_server = env.victim_servers[victim_server_index]
-#             attacker_victim_relation[attacker] = victim_server
-#             attack_types[attacker] = get_attack_type()
-
-#         # variables for each host
-
-#         attacker_state_variables = {}
-#         for attacker in env.attacker_hosts:
-#             cols = env.NBR_HOST_STATE_METRICS + 1
-#             attacker_state_variables[attacker] = {
-#                 'filename': f'attacker_{attacker}_attackType_{attack_types[attacker]}.csv',
-#                 'data': np.empty((env.steps, cols), dtype=object)
-#             }
-#             attacker_state_variables[attacker]['data'][:, 0:(cols - 1)] = 0.0
-#             attacker_state_variables[attacker]['data'][:, (cols - 1)] = ""
-#         server_state_variables = {}
-#         for server in env.servers:
-#             attacker_suffix = ""
-#             for attacker in env.attacker_hosts:
-#                 if attacker_victim_relation[attacker] == server:
-#                     attacker_suffix = f"{attacker_suffix}_attacker_{attacker}_type_{attack_types[attacker]}"
-#             server_state_variables[server] = {
-#                 'filename': f'server_{server}{attacker_suffix}.csv',
-#                 'data': np.zeros((env.steps, env.NBR_HOST_STATE_METRICS))
-#             }
-#         normal_host_state_variables = {}
-#         for host in env.normal_hosts:
-#             cols = env.NBR_HOST_STATE_METRICS + env.nbr_of_network_metrics + 1
-#             normal_host_state_variables[host] = {
-#                 'filename': f'host_{host}.csv',
-#                 'data': np.empty((env.steps, cols), dtype=object)
-#             }
-#             normal_host_state_variables[host]['data'][:, 0:(cols - 1)] = 0.0
-#             normal_host_state_variables[host]['data'][:, (cols - 1)] = ""
-
-#         switches_bw_variables = {
-#             'filename': f'switches_bw.csv',
-#             'data': np.zeros((env.steps, env.nbr_routing_switches + (env.nbr_controlled_switches * env.nbr_controlled_switches)))
-#         }
-
-#         episode_hosts_bw = {}
-#         for host in env.hosts:
-#             episode_hosts_bw[host] = {'data': []}
-
-#         print(f'(Reinforcement) ====================> Init Step Started')
-
-#         new_state = env.get_state(config, cmd, http_client, tshark_interfaces_ids, sender_receiver_relation,
-#                                   attacker_victim_relation, attack_types)
-#         current_state = new_state
-#         env.last_recorded_delay = env.calculate_delay(current_state)
-#         env.last_recorded_latency = env.calculate_latency(current_state)
-#         env.last_recorded_jitter = env.calculate_jitter(current_state)
-#         env.before_last_recorded_delay = env.last_recorded_delay
-
-#         for i in range(1, 1):
-#             print(f'(Reinforcement) ====================> Init Step Started - Additional {i}')
-#             new_state = env.get_state(config, cmd, http_client, tshark_interfaces_ids, sender_receiver_relation,
-#                                       attacker_victim_relation, attack_types)
-#             current_state = new_state
-#             print(f'(Reinforcement) <==================== Init Step Ended - Additional {i}')
-#         print(current_state)
-
-#         print(f'(Reinforcement) <==================== Init Step Ended')
-
-#         # Executes a series of steps within each episode.
-#         # During each step, the RL agent selects an action, and the environment updates its state accordingly.
-#         for step in range(1, env.steps + 1):
-
-#             # The RL agent selects an action either based on its policy or by exploration (random actions).
-#             # The selected action is applied to the environment, which responds with a new state and reward.
-#             # The action's effectiveness is evaluated based on the resulting network performance metrics.
-#             print(f'(Reinforcement) ====================> Step {step} (of episode {episode}) Started')
-
-#             action, is_predicted = ddqn_agent.action(step, env.transform_state_dict_to_normalized_vector(current_state))
-
-#             new_state, reward, done, avg_packet_loss, avg_real_delays, avg_latency, avg_jitter = env.apply_action_controlled_switches(
-#                 config, cmd, http_client, tshark_interfaces_ids, sender_receiver_relation, attacker_victim_relation,
-#                 attack_types, action, is_predicted)
-
-#             episode_avg_packet_loss.append(avg_packet_loss)
-#             episode_avg_real_delays.append(avg_real_delays)
-#             episode_avg_latencys.append(avg_latency)
-#             episode_avg_jitters.append(avg_jitter)
-#             print(new_state)
-
-#             generate_warning_file_if_necessary(config, f"Episode {episode} - Step {step} - Warning.txt", new_state)
-
-#             tot_rewards += reward
-#             episode_rewards.append(reward)
-
-#             ddqn_agent.store(env.transform_state_dict_to_normalized_vector(current_state), action,
-#                              reward, env.transform_state_dict_to_normalized_vector(new_state), done)
-
-#             current_state = new_state
-
-#             # Experience Replay
-#             if len(ddqn_agent.memory) > ddqn_agent.batch_size:
-#                 ddqn_agent.experience_replay(ddqn_agent.batch_size)
-#             else:
-#                 ddqn_agent.episode_loss.append(1)
-
-#             if done or (step % ddqn_agent.update_target_each == 0):
-#                 ddqn_agent.update_target_from_model()
-
-#             do_break = False
-#             if done or step == env.steps:
-#                 total_rewards_per_episode.append(tot_rewards)
-#                 epsilons.append(ddqn_agent.epsilon)
-#                 do_break = True
-
-#             step_index = step - 1
-
-#             #############################################################################################################
-#             # filling state information of each host in each step in order to be saved in a csv file after each episode #
-#             #############################################################################################################
-#             for attacker in env.attacker_hosts:
-#                 arr = np.zeros(env.NBR_HOST_STATE_METRICS)
-#                 i = 0
-#                 for header in get_basic_metrics_headers():
-#                     arr[i] = new_state['host'][attacker][header]
-#                     i = i + 1
-#                 attacker_state_variables[attacker]['data'][step_index, 0:env.NBR_HOST_STATE_METRICS] = arr
-#                 ####################new_state['host']#####################
-#                 for header in get_basic_metrics_headers():
-#                     global_vars_to_print['max_attacker'][header] = max(
-#                         global_vars_to_print['max_attacker'][header], new_state['host'][attacker][header])
-#                 attacker_state_variables[attacker]['data'][step_index, env.NBR_HOST_STATE_METRICS] = str(http_client.get_host_path(attacker).json()['current'])
-#             for server in env.servers:
-#                 arr = np.zeros(env.NBR_HOST_STATE_METRICS)
-#                 i = 0
-#                 for header in get_basic_metrics_headers():
-#                     arr[i] = new_state['host'][server][header]
-#                     i = i + 1
-#                 server_state_variables[server]['data'][step_index, 0:env.NBR_HOST_STATE_METRICS] = arr
-#                 ####################new_state['host']#####################
-#                 for header in get_basic_metrics_headers():
-#                     global_vars_to_print['max_server'][header] = max(
-#                         global_vars_to_print['max_server'][header], new_state['host'][server][header])
-
-#             ######################################## normal host state variable##############################
-#             for normal_host in env.normal_hosts:
-#                 arr = np.zeros(env.NBR_HOST_STATE_METRICS)
-#                 i = 0
-#                 for header in get_basic_metrics_headers():
-#                     arr[i] = new_state['host'][normal_host][header]
-#                     i = i + 1
-#                 normal_host_state_variables[normal_host]['data'][step_index, 0:env.NBR_HOST_STATE_METRICS] = arr
-#                 arr = np.zeros(env.nbr_of_network_metrics)
-#                 i = 0
-#                 for header in get_network_metrics_headers():
-#                     arr[i] = new_state['host'][normal_host]['non_server_data']['network_metrics'][header]
-#                     i = i + 1
-#                 normal_host_state_variables[normal_host]['data'][step_index, env.NBR_HOST_STATE_METRICS:(env.NBR_HOST_STATE_METRICS + env.nbr_of_network_metrics)] = arr
-#                 normal_host_state_variables[normal_host]['data'][step_index, env.NBR_HOST_STATE_METRICS + env.nbr_of_network_metrics] = str(http_client.get_host_path(normal_host).json()['current'])
-#                 ####################new_state['host']#####################
-#                 for header in get_basic_metrics_headers():
-#                     global_vars_to_print['max_host'][header] = max(
-#                         global_vars_to_print['max_host'][header], new_state['host'][normal_host][header])
-#                 for header in get_network_metrics_headers():
-#                     global_vars_to_print['max_host'][header] = max(
-#                         global_vars_to_print['max_host'][header], new_state['host'][normal_host]['non_server_data']['network_metrics'][header])
-#             ######################################## Switches BW variables ##############################
-#             if SWITCHES_BW_HEADERS is None:
-#                 SWITCHES_BW_HEADERS = []
-#                 for src_switch in new_state['routing'].keys():
-#                     for dst_switch in new_state['routing'][src_switch].keys():
-#                         SWITCHES_BW_HEADERS.append(f"{src_switch} -> {dst_switch}")
-#                 for src_switch in new_state['controlled'].keys():
-#                     for dst_switch in new_state['controlled'][src_switch].keys():
-#                         SWITCHES_BW_HEADERS.append(f"{src_switch} -> {dst_switch}")
-#             arr = np.zeros(env.nbr_routing_switches + (env.nbr_controlled_switches * env.nbr_controlled_switches))
-#             i = 0
-#             for src_switch in new_state['routing'].keys():
-#                 for dst_switch in new_state['routing'][src_switch].keys():
-#                     arr[i] = new_state['routing'][src_switch][dst_switch]['bw']
-#                     i = i + 1
-#             for src_switch in new_state['controlled'].keys():
-#                 for dst_switch in new_state['controlled'][src_switch].keys():
-#                     arr[i] = new_state['controlled'][src_switch][dst_switch]['bw']
-#                     i = i + 1
-#             switches_bw_variables['data'][step_index, :] = arr
-
-#             for host in env.hosts:
-#                 episode_hosts_bw[host]['data'].append(Decimal(http_client.get_host_bw(host).json()['bw']))
-
-#             copy_cic_step_file(config, f"Episode {episode} - Step {step} - CIC results.csv")
-
-#             print(f'(Reinforcement) <==================== Step {step} (of episode {episode}) Ended')
-
-#             if do_break:
-#                 break
-
-#         for normal_host in env.normal_hosts:
-#             headers = get_basic_metrics_headers() + get_network_metrics_headers() + ["current_path"]
-#             save_file_with_headers(f"{config.data_folder}/Episode {episode} - {normal_host_state_variables[normal_host]['filename']}", normal_host_state_variables[normal_host]['data'], headers, fmt='%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%s')
-#         for server in env.servers:
-#             save_file_with_headers(f"{config.data_folder}/Episode {episode} - {server_state_variables[server]['filename']}", server_state_variables[server]['data'], get_basic_metrics_headers())
-#         for attacker in env.attacker_hosts:
-#             headers = get_basic_metrics_headers() + ["current_path"]
-#             save_file_with_headers(f"{config.data_folder}/Episode {episode} - {attacker_state_variables[attacker]['filename']}", attacker_state_variables[attacker]['data'], headers, fmt='%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%.18e,%s')
-#         save_file_with_headers(f"{config.data_folder}/Episode {episode} - {switches_bw_variables['filename']}", switches_bw_variables['data'], SWITCHES_BW_HEADERS)
-#         save_file_with_headers(f"{config.data_folder}/Episode {episode} - Actions", env.episode_actions_text_list, ["Action", "Message"], fmt='%s')
-#         # Generates plots to visualize the performance of the RL agent across multiple episodes.
-#         # Graphs include total reward per episode, packet loss, delay, and bandwidth usage.
-#         fig1 = plt.figure(f"Episode {episode} Reward")
-#         plt.plot(range(1, len(episode_rewards) + 1), episode_rewards, color='b', label='rewards')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("Reward")
-#         plt.title(f"Episode {episode} Reward")
-#         fig1.savefig(f"{config.figures_folder}/Episode {episode} - Reward.png")
-#         plt.close(fig1)
-
-#         fig1 = plt.figure(f"Episode {episode} Loss Function")
-#         plt.plot(range(1, len(ddqn_agent.episode_loss) + 1), ddqn_agent.episode_loss, color='r', label='loss function')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("Loss function")
-#         plt.title(f"Episode {episode} Loss Function")
-#         fig1.savefig(f"{config.figures_folder}/Episode {episode} - Loss Function.png")
-#         plt.close(fig1)
-
-#         fig3_1 = plt.figure(f"Episode {episode} PKT loss")
-#         plt.plot(range(1, len(episode_avg_packet_loss) + 1), [100 * x for x in episode_avg_packet_loss], color='b', label='pkt loss')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("PKT loss")
-#         plt.title(f"Episode {episode} PKT loss")
-#         fig3_1.savefig(f"{config.figures_folder}/Episode {episode} - PKT loss.png")
-#         plt.close(fig3_1)
-
-#         fig3_2 = plt.figure(f"Episode {episode} AVG delay")
-#         plt.plot(range(1, len(episode_avg_real_delays) + 1), episode_avg_real_delays, color='r', label='avg delay')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("AVG delay")
-#         plt.title(f"Episode {episode} AVG delay")
-#         fig3_2.savefig(f"{config.figures_folder}/Episode {episode} - AVG delay.png")
-#         plt.close(fig3_2)
-
-#         fig3_3 = plt.figure(f"Episode {episode} AVG latency")
-#         plt.plot(range(1, len(episode_avg_latencys) + 1), episode_avg_latencys, color='g', label='avg latency')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("AVG latency")
-#         plt.title(f"Episode {episode} AVG latency")
-#         fig3_3.savefig(f"{config.figures_folder}/Episode {episode} - AVG latency.png")
-#         plt.close(fig3_3)
-
-#         fig3_4 = plt.figure(f"Episode {episode} AVG jitter")
-#         plt.plot(range(1, len(episode_avg_jitters) + 1), episode_avg_jitters, color='m', label='avg jitter')
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("AVG jitter")
-#         plt.title(f"Episode {episode} AVG jitter")
-#         fig3_4.savefig(f"{config.figures_folder}/Episode {episode} - AVG jitter.png")
-#         plt.close(fig3_4)
-
-#         fig5 = plt.figure(f"Episode {episode} Hosts BW")
-#         for host in env.hosts:
-#             host_label = f'{host}'
-#             if host in env.servers:
-#                 host_label = f'{host_label} (server)'
-#             elif host in env.attacker_hosts:
-#                 host_label = f'{host_label} (attacker {attack_types[host]})'
-#             plt.plot(range(1, len(episode_hosts_bw[host]['data']) + 1), episode_hosts_bw[host]['data'], label=host_label)
-#         plt.legend()
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("BW")
-#         plt.title(f"Episode {episode} Hosts BW")
-#         fig5.savefig(f"{config.figures_folder}/Episode {episode} - Hosts BW")
-#         plt.close(fig5)
-
-#         fig6 = plt.figure(f"Episode {episode} Switches BW")
-#         color = iter(cm.rainbow(np.linspace(0, 1, len(SWITCHES_BW_HEADERS))))
-#         for i in range(len(SWITCHES_BW_HEADERS)):
-#             switch_label = SWITCHES_BW_HEADERS[i]
-#             c = next(color)
-#             plt.plot(range(1, len(switches_bw_variables['data'][:,i]) + 1), switches_bw_variables['data'][:,i],
-#                      label=switch_label, c=c)
-#         plt.legend(loc='center left', bbox_to_anchor=(1, 0))
-#         plt.xlim((1, env.steps))
-#         plt.xlabel("Steps")
-#         plt.ylabel("BW")
-#         plt.title(f"Episode {episode} Switches BW")
-#         fig6.savefig(f"{config.figures_folder}/Episode {episode} - Switches BW", bbox_inches='tight')
-#         plt.close(fig6)
-
-#         print(f'(Reinforcement) <================== Episode {episode} Ended')
-
-#         plt.close('all')
-#         cmd.stop_network()
-
-
-#     ddqn_agent.save_model(f"{config.rl_models_folder}/rl_model")
-
-#     fig = plt.figure(f"Results per Episode")
-#     plt.plot(range(1, env.episodes + 1), total_rewards_per_episode, color='blue', label='Total rewards per episode')
-#     plt.axhline(y=max(total_rewards_per_episode), color='r', linestyle='-', label='Max total reward')
-#     eps_graph = [max(total_rewards_per_episode) * x for x in epsilons]
-#     plt.plot(range(1, env.episodes + 1), eps_graph, color='g', linestyle='-', label='Epsilon')
-#     plt.legend()
-#     plt.xlabel("Episode")
-#     plt.xlim((1, env.episodes))
-#     plt.ylim((min(total_rewards_per_episode), 1.1 * max(total_rewards_per_episode)))
-#     plt.title(f"Results per Episode")
-#     fig.savefig(f"{config.figures_folder}/Last - total rewards and epsilon.png")
-#     plt.close('all')
-
-#     print(global_vars_to_print)
-
-#     print('(Reinforcement) ================> Main Ended')
